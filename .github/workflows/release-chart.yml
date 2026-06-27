@@ -54,10 +54,12 @@ jobs:
 
       - name: Update Helm repo index on gh-pages
         run: |
+          mkdir -p .cr-index
           cr index \
             --owner "${{ github.repository_owner }}" \
             --git-repo "${{ github.event.repository.name }}" \
             --charts-repo "https://jordanruthe.github.io/vaultwarden-operator" \
+            --index-path .cr-index/index.yaml \
             --push
         env:
           CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
