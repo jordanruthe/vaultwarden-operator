@@ -29,15 +29,48 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v4
 
-      - name: Run chart-releaser
-        uses: helm/chart-releaser-action@v1
-        with:
-          charts_dir: charts
+      # Install cr (chart-releaser CLI) directly — we drive it manually so that
+      # packaging is unconditional rather than git-diff-gated (which silently
+      # produces nothing when there are no tags in the repo).
+      - name: Install chart-releaser CLI
+        run: |
+          CR_VERSION=v1.7.0
+          ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+          curl -sSLo cr.tar.gz \
+            "https://github.com/helm/chart-releaser/releases/download/${CR_VERSION}/chart_releaser_${CR_VERSION#v}_linux_${ARCH}.tar.gz"
+          tar -xzf cr.tar.gz cr
+          sudo mv cr /usr/local/bin/cr
+          rm cr.tar.gz
+
+      - name: Package chart
+        run: |
+          mkdir -p .cr-release-packages
+          helm package charts/vaultwarden-operator --destination .cr-release-packages
+
+      - name: Upload chart to GitHub Releases
+        run: |
+          cr upload \
+            --owner "${{ github.repository_owner }}" \
+            --repo "${{ github.event.repository.name }}" \
+            --skip-existing \
+            --packages-with-index=false \
+            --mark-as-latest
         env:
           CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # chart-releaser has already created/updated gh-pages with index.yaml.
-      # Overlay the static landing page without disturbing index.yaml.
+      - name: Update Helm repo index on gh-pages
+        run: |
+          cr index \
+            --owner "${{ github.repository_owner }}" \
+            --repo "${{ github.event.repository.name }}" \
+            --charts-repo "https://jordanruthe.github.io/vaultwarden-operator" \
+            --index-path .cr-index-cache/index.yaml \
+            --push
+        env:
+          CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # cr index --push has committed index.yaml + .nojekyll to gh-pages.
+      # Fetch the updated branch and overlay the static landing page.
       - name: Publish landing page to gh-pages
         run: |
           git fetch origin gh-pages
