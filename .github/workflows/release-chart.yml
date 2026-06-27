@@ -47,7 +47,7 @@ jobs:
         run: |
           cr upload \
             --owner "${{ github.repository_owner }}" \
-            --repo "${{ github.event.repository.name }}" \
+            --git-repo "${{ github.event.repository.name }}" \
             --skip-existing \
             --packages-with-index=false \
             --mark-as-latest
@@ -58,7 +58,7 @@ jobs:
         run: |
           cr index \
             --owner "${{ github.repository_owner }}" \
-            --repo "${{ github.event.repository.name }}" \
+            --git-repo "${{ github.event.repository.name }}" \
             --charts-repo "https://jordanruthe.github.io/vaultwarden-operator" \
             --index-path .cr-index-cache/index.yaml \
             --push
