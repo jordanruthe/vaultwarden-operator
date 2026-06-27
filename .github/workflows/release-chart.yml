@@ -48,9 +48,7 @@ jobs:
           cr upload \
             --owner "${{ github.repository_owner }}" \
             --git-repo "${{ github.event.repository.name }}" \
-            --skip-existing \
-            --packages-with-index=false \
-            --mark-as-latest
+            --skip-existing
         env:
           CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -60,7 +58,6 @@ jobs:
             --owner "${{ github.repository_owner }}" \
             --git-repo "${{ github.event.repository.name }}" \
             --charts-repo "https://jordanruthe.github.io/vaultwarden-operator" \
-            --index-path .cr-index-cache/index.yaml \
             --push
         env:
           CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
