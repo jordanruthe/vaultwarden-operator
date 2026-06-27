@@ -1,0 +1,60 @@
+Thank you for installing {{ .Chart.Name }} v{{ .Chart.AppVersion }}!
+
+{{- if .Values.installCRDs }}
+The VaultwardenSecret CRD has been installed.
+{{- else }}
+NOTE: CRD installation is disabled (installCRDs=false). Make sure the
+VaultwardenSecret CRD is already present in your cluster.
+{{- end }}
+
+==> Prerequisites
+
+Before the operator can start, a credentials Secret must exist:
+
+  kubectl create secret generic {{ .Values.credentials.existingSecret }} \
+    --namespace {{ .Release.Namespace }} \
+    --from-literal=VAULTWARDEN_URL=https://vault.example.com \
+    --from-literal=VAULTWARDEN_EMAIL=operator@example.com \
+    --from-literal=VAULTWARDEN_PASSWORD=supersecret
+
+For API-key auth (bypasses 2FA), also add VAULTWARDEN_CLIENT_ID and
+VAULTWARDEN_CLIENT_SECRET to the Secret and include them via extraEnv:
+
+  extraEnv:
+    - name: VAULTWARDEN_CLIENT_ID
+      valueFrom:
+        secretKeyRef:
+          name: {{ .Values.credentials.existingSecret }}
+          key: VAULTWARDEN_CLIENT_ID
+    - name: VAULTWARDEN_CLIENT_SECRET
+      valueFrom:
+        secretKeyRef:
+          name: {{ .Values.credentials.existingSecret }}
+          key: VAULTWARDEN_CLIENT_SECRET
+
+==> Creating a VaultwardenSecret
+
+Once the operator is running, create a VaultwardenSecret resource:
+
+  cat <<EOF | kubectl apply -f -
+  apiVersion: secrets.vaultwarden.io/v1alpha1
+  kind: VaultwardenSecret
+  metadata:
+    name: my-app-secrets
+    namespace: my-app
+  spec:
+    syncInterval: "5m"
+    data:
+      - key: DATABASE_PASSWORD
+        vaultwardenSecret: "Prod DB"
+      - key: API_KEY
+        vaultwardenSecret: "My API Key"
+  EOF
+
+The operator will write a Kubernetes Secret named my-app-secrets in the my-app
+namespace with DATABASE_PASSWORD and API_KEY populated from vault.
+
+==> Checking status
+
+  kubectl get vaultwardensecrets --all-namespaces
+  kubectl logs -n {{ .Release.Namespace }} deployment/{{ include "vaultwarden-operator.fullname" . }}

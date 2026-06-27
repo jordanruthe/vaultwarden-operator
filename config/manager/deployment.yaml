@@ -1,0 +1,102 @@
+---
+# Pre-requisite: cluster admin must create this Secret before deploying the operator.
+# Example:
+#   kubectl create secret generic vaultwarden-operator-credentials \
+#     --namespace vaultwarden-operator-system \
+#     --from-literal=VAULTWARDEN_URL=https://vault.example.com \
+#     --from-literal=VAULTWARDEN_EMAIL=operator@example.com \
+#     --from-literal=VAULTWARDEN_PASSWORD=supersecret
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vaultwarden-operator
+  namespace: vaultwarden-operator-system
+  labels:
+    app.kubernetes.io/name: vaultwarden-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vaultwarden-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vaultwarden-operator
+    spec:
+      serviceAccountName: vaultwarden-operator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: ghcr.io/jordanfeldman/vaultwarden-operator:latest
+          imagePullPolicy: Always
+          env:
+            - name: VAULTWARDEN_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vaultwarden-operator-credentials
+                  key: VAULTWARDEN_URL
+            - name: VAULTWARDEN_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: vaultwarden-operator-credentials
+                  key: VAULTWARDEN_EMAIL
+            - name: VAULTWARDEN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: vaultwarden-operator-credentials
+                  key: VAULTWARDEN_PASSWORD
+            # Optional: API key auth (bypasses 2FA)
+            # - name: VAULTWARDEN_CLIENT_ID
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: vaultwarden-operator-credentials
+            #       key: VAULTWARDEN_CLIENT_ID
+            # - name: VAULTWARDEN_CLIENT_SECRET
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: vaultwarden-operator-credentials
+            #       key: VAULTWARDEN_CLIENT_SECRET
+            - name: RUST_LOG
+              value: "info"
+          ports:
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          volumeMounts:
+            - mountPath: /tmp
+              name: tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      terminationGracePeriodSeconds: 10
