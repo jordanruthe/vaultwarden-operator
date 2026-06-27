@@ -1,0 +1,56 @@
+name: Release Helm Chart
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "charts/**"
+      - "pages/**"
+  workflow_dispatch:
+
+jobs:
+  release:
+    name: Package & Publish Chart
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Run chart-releaser
+        uses: helm/chart-releaser-action@v1
+        with:
+          charts_dir: charts
+        env:
+          CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # chart-releaser has already created/updated gh-pages with index.yaml.
+      # Overlay the static landing page without disturbing index.yaml.
+      - name: Publish landing page to gh-pages
+        run: |
+          git fetch origin gh-pages
+          git worktree add /tmp/gh-pages gh-pages
+
+          cp pages/index.html /tmp/gh-pages/index.html
+          cp pages/.nojekyll  /tmp/gh-pages/.nojekyll
+
+          cd /tmp/gh-pages
+          git add index.html .nojekyll
+          if git diff --cached --quiet; then
+            echo "Landing page unchanged, nothing to push."
+          else
+            git commit -m "chore: update landing page"
+            git push origin gh-pages
+          fi

@@ -1,0 +1,24 @@
+apiVersion: v2
+name: vaultwarden-operator
+description: >
+  A Kubernetes operator that syncs secrets from a Vaultwarden (self-hosted Bitwarden)
+  instance into native Kubernetes Secret objects using client-side Bitwarden crypto.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.21.0-0"
+
+keywords:
+  - vaultwarden
+  - bitwarden
+  - secrets
+  - operator
+
+sources:
+  - https://github.com/jordanruthe/vaultwarden-operator
+
+maintainers:
+  - name: Jordan
+
+annotations:
+  licenses: MIT

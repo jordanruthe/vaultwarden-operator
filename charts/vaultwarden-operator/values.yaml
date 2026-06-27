@@ -1,0 +1,133 @@
+# -- Install the VaultwardenSecret CRD. Set to false if you manage the CRD separately.
+installCRDs: true
+
+image:
+  # -- Container image repository.
+  repository: ghcr.io/jordanruthe/vaultwarden-operator
+  # -- Image tag. Defaults to the chart appVersion when empty.
+  tag: ""
+  # -- Image pull policy. IfNotPresent is recommended for pinned tags.
+  pullPolicy: IfNotPresent
+
+# -- Image pull secrets for private registries.
+imagePullSecrets: []
+
+# -- Number of operator replicas. The operator does not implement leader election — keep this at 1.
+replicaCount: 1
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Create a ServiceAccount for the operator.
+  create: true
+  # -- Name of the ServiceAccount to use. If empty, a name is generated using the fullname helper.
+  name: ""
+  # -- Annotations to add to the ServiceAccount.
+  annotations: {}
+
+rbac:
+  # -- Create ClusterRole and ClusterRoleBinding for the operator.
+  create: true
+
+# -- Reference to the pre-existing Secret that holds Vaultwarden credentials.
+# The Secret must contain VAULTWARDEN_URL, VAULTWARDEN_EMAIL, and VAULTWARDEN_PASSWORD.
+# See README for creation instructions.
+credentials:
+  existingSecret: "vaultwarden-operator-credentials"
+
+# -- Static environment variables added to the operator container.
+env:
+  RUST_LOG: "info"
+
+# -- Additional environment variables to append (raw envVar objects).
+# Use this to inject optional VAULTWARDEN_CLIENT_ID / VAULTWARDEN_CLIENT_SECRET
+# from the credentials Secret:
+#
+# extraEnv:
+#   - name: VAULTWARDEN_CLIENT_ID
+#     valueFrom:
+#       secretKeyRef:
+#         name: vaultwarden-operator-credentials
+#         key: VAULTWARDEN_CLIENT_ID
+#   - name: VAULTWARDEN_CLIENT_SECRET
+#     valueFrom:
+#       secretKeyRef:
+#         name: vaultwarden-operator-credentials
+#         key: VAULTWARDEN_CLIENT_SECRET
+extraEnv: []
+
+# -- Pod-level security context.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Container-level security context.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# -- Resource requests and limits for the operator container.
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+# -- Port that the health server listens on.
+healthPort: 8081
+
+livenessProbe:
+  initialDelaySeconds: 15
+  periodSeconds: 20
+
+readinessProbe:
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+networkPolicy:
+  # -- Enable the NetworkPolicy that restricts operator pod traffic.
+  enabled: true
+  # -- Ports allowed for ingress (health probes).
+  ingressPorts:
+    - port: 8081
+      protocol: TCP
+  # -- Ports allowed for egress.
+  egressPorts:
+    # DNS
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+    # Vaultwarden HTTPS + Kubernetes API
+    - port: 443
+      protocol: TCP
+    - port: 6443
+      protocol: TCP
+
+# -- Node selector for the operator pod.
+nodeSelector: {}
+
+# -- Tolerations for the operator pod.
+tolerations: []
+
+# -- Affinity rules for the operator pod.
+affinity: {}
+
+# -- Annotations to add to the operator pod.
+podAnnotations: {}
+
+# -- Labels to add to the operator pod.
+podLabels: {}
+
+# -- Grace period for pod termination.
+terminationGracePeriodSeconds: 10

@@ -1,0 +1,57 @@
+{{- if .Values.rbac.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "vaultwarden-operator.fullname" . }}
+  labels:
+    {{- include "vaultwarden-operator.labels" . | nindent 4 }}
+rules:
+  # VaultwardenSecret CRD
+  - apiGroups:
+      - secrets.vaultwarden.io
+    resources:
+      - vaultwardensecrets
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - secrets.vaultwarden.io
+    resources:
+      - vaultwardensecrets/status
+    verbs:
+      - get
+      - update
+      - patch
+  - apiGroups:
+      - secrets.vaultwarden.io
+    resources:
+      - vaultwardensecrets/finalizers
+    verbs:
+      - update
+  # Managed output Secrets
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  # Events
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+{{- end }}

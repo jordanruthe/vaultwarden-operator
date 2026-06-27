@@ -1,0 +1,33 @@
+---
+# Restrict operator pod network access:
+# - Ingress: only health probes on 8081
+# - Egress: DNS (53), Vaultwarden HTTPS (443), Kubernetes API (6443)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vaultwarden-operator
+  namespace: vaultwarden-operator-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: vaultwarden-operator
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - port: 8081
+          protocol: TCP
+  egress:
+    # DNS
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Vaultwarden HTTPS + Kubernetes API
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
