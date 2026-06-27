@@ -29,18 +29,14 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v4
 
-      # Install cr (chart-releaser CLI) directly — we drive it manually so that
-      # packaging is unconditional rather than git-diff-gated (which silently
-      # produces nothing when there are no tags in the repo).
+      # Install cr via the action (install_only skips the built-in release logic)
+      # so we can drive package/upload/index manually and avoid git-diff gating.
       - name: Install chart-releaser CLI
-        run: |
-          CR_VERSION=v1.7.0
-          ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
-          curl -sSLo cr.tar.gz \
-            "https://github.com/helm/chart-releaser/releases/download/${CR_VERSION}/chart_releaser_${CR_VERSION#v}_linux_${ARCH}.tar.gz"
-          tar -xzf cr.tar.gz cr
-          sudo mv cr /usr/local/bin/cr
-          rm cr.tar.gz
+        uses: helm/chart-releaser-action@v1
+        with:
+          install_only: true
+        env:
+          CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Package chart
         run: |
