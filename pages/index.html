@@ -77,6 +77,11 @@
       font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
     }
 
+    .tok-comment { color: #8b949e; font-style: italic; }
+    .tok-cmd     { color: #ff7b72; }
+    .tok-flag    { color: #79c0ff; }
+    .tok-str     { color: #a5d6ff; }
+
     .links {
       display: flex;
       gap: 1rem;
@@ -114,14 +119,21 @@
     </p>
 
     <h2>Install via Helm</h2>
-    <pre># Add the chart repository
-helm repo add vaultwarden-operator https://jordanruthe.github.io/vaultwarden-operator
-helm repo update
+    <pre><span class="tok-comment"># Add the chart repository</span>
+<span class="tok-cmd">helm</span> <span class="tok-flag">repo add</span> <span class="tok-str">vaultwarden-operator https://jordanruthe.github.io/vaultwarden-operator</span>
+<span class="tok-cmd">helm</span> <span class="tok-flag">repo update</span>
 
-# Install into your cluster
-helm install vaultwarden-operator vaultwarden-operator/vaultwarden-operator \
-  --namespace vaultwarden-operator-system \
-  --create-namespace</pre>
+<span class="tok-comment"># Install into your cluster</span>
+<span class="tok-cmd">helm</span> <span class="tok-flag">install</span> <span class="tok-str">vaultwarden-operator vaultwarden-operator/vaultwarden-operator</span> \
+  <span class="tok-flag">--namespace</span> <span class="tok-str">vaultwarden-operator-system</span> \
+  <span class="tok-flag">--create-namespace</span>
+
+<span class="tok-comment"># Create the Vaultwarden credentials Secret</span>
+<span class="tok-cmd">kubectl</span> <span class="tok-flag">create secret generic</span> <span class="tok-str">vaultwarden-operator-credentials</span> \
+  <span class="tok-flag">--namespace</span> <span class="tok-str">vaultwarden-operator-system</span> \
+  <span class="tok-flag">--from-literal</span>=<span class="tok-str">VAULTWARDEN_URL=https://vault.example.com</span> \
+  <span class="tok-flag">--from-literal</span>=<span class="tok-str">VAULTWARDEN_EMAIL=operator@example.com</span> \
+  <span class="tok-flag">--from-literal</span>=<span class="tok-str">VAULTWARDEN_PASSWORD=supersecret</span></pre>
 
     <div class="links">
       <a href="https://github.com/jordanruthe/vaultwarden-operator">
