@@ -3,7 +3,9 @@
 # ---------------------------------------------------------------------------
 # Stage 1: dependency cache (cargo-chef pattern avoids re-downloading crates)
 # ---------------------------------------------------------------------------
-FROM rust:1-bookworm AS chef
+FROM rust:1-alpine AS chef
+# musl-dev + gcc + make + perl are required to compile ring and link musl targets
+RUN apk add --no-cache musl-dev gcc make perl
 RUN cargo install cargo-chef --locked
 WORKDIR /build
 
@@ -27,14 +29,13 @@ RUN cargo build --release --bin vaultwarden-operator
 # ---------------------------------------------------------------------------
 # Stage 3: minimal runtime image
 # ---------------------------------------------------------------------------
-FROM debian:bookworm-slim AS runtime
+FROM alpine:3 AS runtime
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache ca-certificates
 
-# Non-root user matching the deployment securityContext.
-RUN groupadd -g 65532 nonroot && useradd -u 65532 -g nonroot -s /sbin/nologin nonroot
+# Non-root user matching the deployment securityContext (busybox addgroup/adduser).
+RUN addgroup -g 65532 -S nonroot \
+ && adduser -u 65532 -S -G nonroot -s /sbin/nologin nonroot
 
 COPY --from=builder /build/target/release/vaultwarden-operator /usr/local/bin/vaultwarden-operator
 

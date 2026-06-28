@@ -17,7 +17,7 @@ use std::{sync::Arc, time::Duration};
 use futures::StreamExt;
 use kube::{
     api::Api,
-    runtime::{controller::Controller, watcher},
+    runtime::{controller::Controller, predicates, reflector, watcher, WatchStreamExt},
     Client,
 };
 use tracing::info;
@@ -122,7 +122,18 @@ async fn main() -> anyhow::Result<()> {
     let vws_api: Api<VaultwardenSecret> = Api::all(kube_client.clone());
     let secrets_api: Api<k8s_openapi::api::core::v1::Secret> = Api::all(kube_client.clone());
 
-    Controller::new(vws_api, watcher::Config::default())
+    // Use a generation predicate to filter the VaultwardenSecret watch stream.
+    // This prevents the controller from re-reconciling on its own status writes,
+    // which would otherwise cause a hot reconcile loop (status patch → watch event
+    // → immediate re-reconcile → status patch → …).
+    let (reader, writer) = reflector::store();
+    let vws_stream = watcher(vws_api, watcher::Config::default())
+        .default_backoff()
+        .reflect(writer)
+        .applied_objects()
+        .predicate_filter(predicates::generation);
+
+    Controller::for_stream(vws_stream, reader)
         .owns(secrets_api, watcher::Config::default())
         .shutdown_on_signal()
         .run(reconcile, error_policy, ctx)

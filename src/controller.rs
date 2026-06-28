@@ -21,7 +21,7 @@ use kube::{
 };
 use serde_json::json;
 use thiserror::Error;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     crd::{StatusCondition, VaultwardenSecret, VaultwardenSecretStatus},
@@ -159,7 +159,7 @@ async fn reconcile_apply(
                 .await?;
         }
         Some(_) => {
-            info!(vws = %name, ns = %ns, "patching managed Secret");
+            debug!(vws = %name, ns = %ns, "patching managed Secret");
             secrets_api
                 .patch(
                     &name,
@@ -172,7 +172,7 @@ async fn reconcile_apply(
 
     // Update status: success.
     set_ready_status(&vws, &ctx).await?;
-    info!(vws = %name, ?interval, "reconcile complete; requeuing");
+    debug!(vws = %name, ?interval, "reconcile complete; requeuing");
 
     Ok(Action::requeue(interval))
 }

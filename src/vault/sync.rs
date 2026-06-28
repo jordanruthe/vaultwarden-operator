@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use super::crypto::{decrypt_org_key, decrypt_private_key, decrypt_str, CryptoError, SymmetricKey};
 
@@ -176,7 +176,7 @@ pub fn decrypt_vault(sync: &SyncResponse, sym_key: &SymmetricKey) -> Vec<Decrypt
                         Err(e) => warn!(org_id = %org.id, err = %e, "failed to decrypt org key"),
                     }
                 }
-                info!(count = org_keys.len(), "decrypted org keys");
+                debug!(count = org_keys.len(), "decrypted org keys");
             }
             Err(e) => {
                 warn!(err = %e, "failed to decrypt RSA private key; org items will be skipped")
@@ -207,7 +207,7 @@ pub fn decrypt_vault(sync: &SyncResponse, sym_key: &SymmetricKey) -> Vec<Decrypt
         }
     }
 
-    info!(count = items.len(), "decrypted vault items");
+    debug!(count = items.len(), "decrypted vault items");
     items
 }
 
