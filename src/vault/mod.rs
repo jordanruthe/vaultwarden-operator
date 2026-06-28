@@ -279,6 +279,20 @@ impl VaultClient {
     }
 }
 
+/// Walk `std::error::Error::source()` and return the full error chain as a single string.
+///
+/// This produces a message like `"outer: ... -> inner: ... -> root cause"` that contains
+/// the reqwest source (dns error, connect error, TLS error, etc.) which Display alone hides.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        out.push_str(&format!(" -> {s}"));
+        src = s.source();
+    }
+    out
+}
+
 /// Initialize a `VaultClient` with up to 3 retry attempts using quadratic backoff.
 ///
 /// Mirrors `InitializeAPIClient` from Go's `init.go`.
@@ -313,7 +327,7 @@ pub async fn initialize_vault_client(
                 return Ok(client);
             }
             Err(e) => {
-                warn!(attempt, err = %e, "vault client init attempt failed");
+                warn!(attempt, err = %error_chain(&e), "vault client init attempt failed");
                 if attempt == max_retries {
                     return Err(e);
                 }
