@@ -17,7 +17,7 @@ use std::{sync::Arc, time::Duration};
 use futures::StreamExt;
 use kube::{
     api::Api,
-    runtime::{controller::Controller, predicates, reflector, watcher, WatchStreamExt},
+    runtime::{controller::Controller, predicates, reflector, watcher, Predicate, WatchStreamExt},
     Client,
 };
 use tracing::info;
@@ -122,16 +122,24 @@ async fn main() -> anyhow::Result<()> {
     let vws_api: Api<VaultwardenSecret> = Api::all(kube_client.clone());
     let secrets_api: Api<k8s_openapi::api::core::v1::Secret> = Api::all(kube_client.clone());
 
-    // Use a generation predicate to filter the VaultwardenSecret watch stream.
+    // Use a combined predicate to filter the VaultwardenSecret watch stream.
     // This prevents the controller from re-reconciling on its own status writes,
     // which would otherwise cause a hot reconcile loop (status patch → watch event
     // → immediate re-reconcile → status patch → …).
+    //
+    // generation alone is insufficient: adding the finalizer is a metadata change that
+    // does NOT bump generation. The kube finalizer() helper adds the finalizer and then
+    // returns Action::await_change(), expecting the patch to trigger a fresh watch event.
+    // With generation-only filtering that event is dropped, stranding the object without
+    // a Secret or status until the operator restarts. Combining with finalizers lets
+    // the finalizer-add event through while still filtering status-only writes (which
+    // change neither generation nor finalizers).
     let (reader, writer) = reflector::store();
     let vws_stream = watcher(vws_api, watcher::Config::default())
         .default_backoff()
         .reflect(writer)
         .applied_objects()
-        .predicate_filter(predicates::generation);
+        .predicate_filter(predicates::generation.combine(predicates::finalizers));
 
     Controller::for_stream(vws_stream, reader)
         .owns(secrets_api, watcher::Config::default())
@@ -140,6 +148,11 @@ async fn main() -> anyhow::Result<()> {
         .for_each(|result| async move {
             match result {
                 Ok(obj) => tracing::debug!(?obj, "reconciled"),
+                // ObjectNotFound fires when a requeue fires after the CR is already gone from
+                // the store (benign race on deletion); log at debug to avoid spurious warnings.
+                Err(e) if matches!(e, kube::runtime::controller::Error::ObjectNotFound(_)) => {
+                    tracing::debug!(err = %e, "reconcile skipped: object no longer in store")
+                }
                 Err(e) => tracing::warn!(err = %e, "reconcile error"),
             }
         })
