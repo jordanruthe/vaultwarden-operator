@@ -8,7 +8,8 @@ use crd::VaultwardenSecret;
 use kube::CustomResourceExt;
 
 fn main() {
-    let crd = VaultwardenSecret::crd();
+    let mut crd = VaultwardenSecret::crd();
+    crd.spec.names.categories = None;
     let yaml = serde_yaml::to_string(&crd).expect("serialize CRD");
     print!("{yaml}");
 }
