@@ -54,3 +54,14 @@ rules:
     verbs:
       - create
       - patch
+  # Leader election Lease
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - create
+      - update
+      - patch
+      - delete

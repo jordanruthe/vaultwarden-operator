@@ -69,7 +69,7 @@ kubectl delete crd vaultwardensecrets.secrets.vaultwarden.io
 | `image.tag` | string | `""` | Image tag (defaults to chart appVersion) |
 | `image.pullPolicy` | string | `IfNotPresent` | Image pull policy |
 | `imagePullSecrets` | list | `[]` | Image pull secrets |
-| `replicaCount` | int | `1` | Number of replicas (keep at 1, no leader election) |
+| `replicaCount` | int | `1` | Number of replicas. Leader election is enabled so `>1` is safe for HA. |
 | `nameOverride` | string | `""` | Override for chart name |
 | `fullnameOverride` | string | `""` | Override for full resource name |
 | `serviceAccount.create` | bool | `true` | Create a ServiceAccount |

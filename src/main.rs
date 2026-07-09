@@ -1,15 +1,19 @@
 //! Vaultwarden Kubernetes operator entrypoint.
 //!
-//! Reads configuration from environment, authenticates with Vaultwarden,
-//! then runs:
-//! - Background token refresh task
-//! - Background vault cache refresh task
-//! - Kubernetes controller (VaultwardenSecret reconciler)
-//! - Health probe server on :8081
+//! Reads configuration from environment, then runs:
+//! - Health probe server on :8081 (started early so standby replicas pass probes)
+//! - Leader election via a `coordination.k8s.io/v1` Lease
+//! - Once leader: Vaultwarden authentication, background token/cache refresh, and
+//!   the Kubernetes controller (VaultwardenSecret reconciler)
+//!
+//! When leadership is lost the process exits, which causes Kubernetes to restart
+//! the pod. It will re-contend for leadership as a fresh standby, avoiding
+//! split-brain scenarios without needing in-process state cleanup.
 
 mod controller;
 mod crd;
 mod health;
+mod leader;
 mod vault;
 
 use std::{sync::Arc, time::Duration};
@@ -56,7 +60,33 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // ---------------------------------------------------------------------------
-    // Configuration from environment
+    // Kubernetes client (early — needed for leader election and health probes)
+    // ---------------------------------------------------------------------------
+    let kube_client = Client::try_default().await?;
+
+    // ---------------------------------------------------------------------------
+    // Health probe server — started BEFORE leader election so standby replicas
+    // pass liveness/readiness probes while waiting for the lease.
+    // ---------------------------------------------------------------------------
+    tokio::spawn(health::serve());
+
+    // ---------------------------------------------------------------------------
+    // Leader election
+    //
+    // Block until this replica acquires the Lease. Standby replicas loop here,
+    // checking the lease every few seconds. SIGTERM while waiting causes a clean
+    // exit (handled inside `leader::acquire`).
+    //
+    // Once `acquire` returns, this process is the active leader.
+    // ---------------------------------------------------------------------------
+    let leader_cfg = leader::LeaderConfig::from_env(&kube_client);
+    let lease_lock = leader::acquire(kube_client.clone(), &leader_cfg).await;
+
+    info!("running as leader; initializing vault client");
+
+    // ---------------------------------------------------------------------------
+    // Configuration from environment (only read after becoming leader so standby
+    // pods don't need vault credentials or establish Vaultwarden sessions)
     // ---------------------------------------------------------------------------
     let vault_url = required_env("VAULTWARDEN_URL");
     let vault_email = required_env("VAULTWARDEN_EMAIL");
@@ -79,14 +109,6 @@ async fn main() -> anyhow::Result<()> {
     info!("vault client ready; starting controller");
 
     // ---------------------------------------------------------------------------
-    // Kubernetes client
-    // ---------------------------------------------------------------------------
-    let kube_client = Client::try_default().await?;
-
-    // Ensure the CRD is registered (informative only; the operator won't install it).
-    let _: Api<VaultwardenSecret> = Api::all(kube_client.clone());
-
-    // ---------------------------------------------------------------------------
     // Background tasks: token refresh + vault cache refresh
     // ---------------------------------------------------------------------------
     // Use a watch channel as a cancellation signal.
@@ -107,9 +129,41 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // ---------------------------------------------------------------------------
-    // Health probe server
+    // Lease renewal task
+    //
+    // Spawn a task that renews the lease on a tight loop. When leadership is
+    // lost (or renewal fails too many times) `keep_renewing` returns, signalling
+    // via a oneshot channel so the controller shuts down.
     // ---------------------------------------------------------------------------
-    tokio::spawn(health::serve());
+    let (lease_lost_tx, lease_lost_rx) = tokio::sync::oneshot::channel::<()>();
+    let lease_lock_arc = Arc::new(lease_lock);
+    let lease_lock_renew = lease_lock_arc.clone();
+
+    tokio::spawn(async move {
+        leader::keep_renewing(&lease_lock_renew, &leader_cfg).await;
+        // Signal: leadership lost. The controller's shutdown future will resolve.
+        let _ = lease_lost_tx.send(());
+    });
+
+    // ---------------------------------------------------------------------------
+    // Graceful shutdown future
+    //
+    // The controller stops when EITHER:
+    //   - SIGTERM/SIGINT is received (normal pod termination / rollout), or
+    //   - the lease is lost (lease_lost_rx fires).
+    //
+    // We fuse both into a single future for `graceful_shutdown_on`.
+    // ---------------------------------------------------------------------------
+    let shutdown_signal = async move {
+        tokio::select! {
+            _ = sigterm_or_ctrlc() => {
+                info!("signal received; shutting down controller");
+            }
+            _ = async { lease_lost_rx.await.ok(); } => {
+                tracing::warn!("leadership lost; shutting down controller and exiting");
+            }
+        }
+    };
 
     // ---------------------------------------------------------------------------
     // Controller
@@ -143,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
 
     Controller::for_stream(vws_stream, reader)
         .owns(secrets_api, watcher::Config::default())
-        .shutdown_on_signal()
+        .graceful_shutdown_on(shutdown_signal)
         .run(reconcile, error_policy, ctx)
         .for_each(|result| async move {
             match result {
@@ -161,5 +215,27 @@ async fn main() -> anyhow::Result<()> {
     info!("controller stopped; shutting down background tasks");
     let _ = shutdown_tx.send(true);
 
+    // Best-effort step-down: if leadership was lost the renewal task already
+    // called step_down(); on a normal SIGTERM we call it here to let a successor
+    // acquire the lease immediately.
+    if let Err(e) = lease_lock_arc.step_down().await {
+        tracing::warn!(err = %e, "step_down on exit failed (non-fatal)");
+    }
+
     Ok(())
+}
+
+/// Returns a future that resolves on SIGTERM (unix) or ctrl-c.
+async fn sigterm_or_ctrlc() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut s) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = s.recv() => return,
+                _ = tokio::signal::ctrl_c() => return,
+            }
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }

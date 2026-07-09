@@ -12,7 +12,10 @@ image:
 # -- Image pull secrets for private registries.
 imagePullSecrets: []
 
-# -- Number of operator replicas. The operator does not implement leader election — keep this at 1.
+# -- Number of operator replicas. The operator uses leader election via a
+# coordination.k8s.io/v1 Lease, so running >1 replica is safe and recommended
+# for high availability. Exactly one replica will be active at a time; others
+# stand by and take over if the leader pod is removed or its lease expires.
 replicaCount: 1
 
 nameOverride: ""

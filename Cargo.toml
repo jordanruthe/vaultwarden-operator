@@ -18,6 +18,7 @@ path = "src/crdgen.rs"
 kube = { version = "0.97", features = ["runtime", "derive", "client", "rustls-tls", "unstable-runtime"] }
 k8s-openapi = { version = "0.23", features = ["v1_31"] }
 schemars = { version = "0.8", features = ["chrono"] }
+kube-leader-election = "0.38"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -53,6 +54,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde_yaml = "0.9"
+gethostname = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
