@@ -1,0 +1,10 @@
+{
+  "name": "vaultwarden-operator-e2e",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Helper tooling for scripts/e2e-test.sh: drives the Vaultwarden web vault to register a throwaway test account (bw CLI has no non-interactive register command).",
+  "dependencies": {
+    "playwright": "^1.61.1",
+    "http-proxy": "^1.18.1"
+  }
+}
