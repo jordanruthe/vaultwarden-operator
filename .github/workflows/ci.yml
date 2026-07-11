@@ -152,3 +152,89 @@ jobs:
       - name: Inspect manifest
         run: |
           docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+
+  # ---------------------------------------------------------------------------
+  # Release Helm chart + GitHub Release (version tags only)
+  # ---------------------------------------------------------------------------
+  release:
+    name: Release Chart & GitHub Release
+    runs-on: ubuntu-latest
+    needs: docker-merge
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Derive version from tag
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Sync Chart.yaml to tag version
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          yq -i '.version = strenv(VERSION) | .appVersion = strenv(VERSION)' \
+            charts/vaultwarden-operator/Chart.yaml
+
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+
+      - name: Install chart-releaser CLI
+        uses: helm/chart-releaser-action@v1
+        with:
+          install_only: true
+
+      - name: Package chart
+        run: |
+          mkdir -p .cr-release-packages
+          helm package charts/vaultwarden-operator --destination .cr-release-packages
+
+      - name: Create GitHub Release with chart asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            .cr-release-packages/*.tgz \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag
+
+      - name: Update Helm repo index on gh-pages
+        env:
+          CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p .cr-index
+          cr index \
+            --owner "${{ github.repository_owner }}" \
+            --git-repo "${{ github.event.repository.name }}" \
+            --charts-repo "https://jordanruthe.github.io/vaultwarden-operator" \
+            --release-name-template "v{{ .Version }}" \
+            --index-path .cr-index/index.yaml \
+            --pages-branch gh-pages \
+            --push
+
+      - name: Publish landing page to gh-pages
+        run: |
+          git fetch origin gh-pages
+          git worktree add /tmp/gh-pages gh-pages
+
+          cp pages/index.html /tmp/gh-pages/index.html
+          cp pages/.nojekyll  /tmp/gh-pages/.nojekyll
+
+          cd /tmp/gh-pages
+          git add index.html .nojekyll
+          if git diff --cached --quiet; then
+            echo "Landing page unchanged, nothing to push."
+          else
+            git commit -m "chore: update landing page"
+            git push origin gh-pages
+          fi
