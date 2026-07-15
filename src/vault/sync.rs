@@ -118,6 +118,8 @@ pub struct SyncField {
 pub struct DecryptedItem {
     pub id: String,
     pub cipher_type: u8,
+    /// Owning organization id; `None` for personal-vault items.
+    pub organization_id: Option<String>,
     pub name: String,
     pub username: String,
     pub password: String,
@@ -125,6 +127,29 @@ pub struct DecryptedItem {
     pub uri: String,
     /// Custom fields by decrypted field name.
     pub fields: HashMap<String, String>,
+}
+
+/// A decrypted vault snapshot: items plus an organization-name index.
+#[derive(Debug, Clone, Default)]
+pub struct VaultCache {
+    pub items: Vec<DecryptedItem>,
+    /// Lowercased organization name -> org ids. More than one id means the
+    /// name is ambiguous. Includes orgs whose key failed to decrypt (their
+    /// items are absent, so scoped lookups report "not found in vault").
+    pub orgs_by_name: HashMap<String, Vec<String>>,
+}
+
+/// Errors from a vault-scoped item lookup.
+#[derive(Debug, Error)]
+pub enum LookupError {
+    #[error("vault (organization) {0:?} not found")]
+    VaultNotFound(String),
+    #[error("vault name {0:?} matches multiple organizations; use a unique name")]
+    VaultAmbiguous(String),
+    #[error("secret {name:?} not found in vault {vault:?}")]
+    NotFoundInVault { name: String, vault: String },
+    #[error("secret {0:?} not found in vault cache")]
+    NotFound(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -159,9 +184,21 @@ pub async fn fetch_sync(
     Ok(resp.json::<SyncResponse>().await?)
 }
 
+/// Build the case-insensitive organization-name index for a vault cache.
+pub fn index_orgs(orgs: &[SyncOrganization]) -> HashMap<String, Vec<String>> {
+    let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
+    for org in orgs {
+        by_name
+            .entry(org.name.to_lowercase())
+            .or_default()
+            .push(org.id.clone());
+    }
+    by_name
+}
+
 /// Decrypt all ciphers in a sync response using the user's symmetric key
 /// and any organisation keys derived from the user's RSA private key.
-pub fn decrypt_vault(sync: &SyncResponse, sym_key: &SymmetricKey) -> Vec<DecryptedItem> {
+pub fn decrypt_vault(sync: &SyncResponse, sym_key: &SymmetricKey) -> VaultCache {
     // Decrypt org keys if we have a private key.
     let mut org_keys: HashMap<String, SymmetricKey> = HashMap::new();
     if !sync.profile.organizations.is_empty() && !sync.profile.private_key.is_empty() {
@@ -208,7 +245,10 @@ pub fn decrypt_vault(sync: &SyncResponse, sym_key: &SymmetricKey) -> Vec<Decrypt
     }
 
     debug!(count = items.len(), "decrypted vault items");
-    items
+    VaultCache {
+        items,
+        orgs_by_name: index_orgs(&sync.profile.organizations),
+    }
 }
 
 /// Decrypt a single cipher into a `DecryptedItem`.
@@ -265,6 +305,7 @@ pub fn decrypt_cipher(
     Ok(DecryptedItem {
         id: cipher.id.clone(),
         cipher_type: cipher.cipher_type,
+        organization_id: cipher.organization_id.clone().filter(|id| !id.is_empty()),
         name,
         username,
         password,
@@ -274,30 +315,73 @@ pub fn decrypt_cipher(
     })
 }
 
-/// Search `items` for `name`.
+/// Search `items` for `name`, optionally restricted to one organization.
 ///
 /// Priority:
 /// 1. Exact case-insensitive match.
 /// 2. Substring (partial) match.
-pub fn find_item<'a>(items: &'a [DecryptedItem], name: &str) -> Option<&'a DecryptedItem> {
+///
+/// With `org_id = None`, items from the personal vault and all organizations
+/// match (legacy behavior). With `org_id = Some(..)`, only items owned by
+/// that organization match.
+pub fn find_item<'a>(
+    items: &'a [DecryptedItem],
+    name: &str,
+    org_id: Option<&str>,
+) -> Option<&'a DecryptedItem> {
     let key = name.to_lowercase();
+    let in_scope =
+        |item: &DecryptedItem| org_id.is_none_or(|id| item.organization_id.as_deref() == Some(id));
 
     // Exact match.
     for item in items {
-        if item.name.to_lowercase() == key {
+        if in_scope(item) && item.name.to_lowercase() == key {
             return Some(item);
         }
     }
 
     // Partial match.
     for item in items {
-        if item.name.to_lowercase().contains(&key) {
+        if in_scope(item) && item.name.to_lowercase().contains(&key) {
             debug!("partial match found for secret lookup");
             return Some(item);
         }
     }
 
     None
+}
+
+/// Look up `name` in the cache, scoped to `vault` (an organization name,
+/// case-insensitive) when given.
+///
+/// A scoped lookup never falls back to other vaults or the personal vault:
+/// a miss inside the named organization is an error. Note that an
+/// organization whose key failed to decrypt still resolves by name; its
+/// items are simply absent, so lookups report `NotFoundInVault`.
+pub fn lookup_item<'a>(
+    cache: &'a VaultCache,
+    name: &str,
+    vault: Option<&str>,
+) -> Result<&'a DecryptedItem, LookupError> {
+    match vault {
+        Some(v) => {
+            let org_ids = cache
+                .orgs_by_name
+                .get(&v.to_lowercase())
+                .ok_or_else(|| LookupError::VaultNotFound(v.to_string()))?;
+            if org_ids.len() > 1 {
+                return Err(LookupError::VaultAmbiguous(v.to_string()));
+            }
+            find_item(&cache.items, name, Some(&org_ids[0])).ok_or_else(|| {
+                LookupError::NotFoundInVault {
+                    name: name.to_string(),
+                    vault: v.to_string(),
+                }
+            })
+        }
+        None => find_item(&cache.items, name, None)
+            .ok_or_else(|| LookupError::NotFound(name.to_string())),
+    }
 }
 
 /// Extract the most relevant secret value from a decrypted item.
@@ -424,6 +508,27 @@ mod tests {
         // Should succeed with org key.
         let item = decrypt_cipher(&cipher, &org_key).unwrap();
         assert_eq!(item.name, "ORG_SECRET");
+        assert_eq!(item.organization_id.as_deref(), Some("org-123"));
+    }
+
+    #[test]
+    fn test_decrypt_cipher_empty_org_id_normalized() {
+        let (key, enc_key, mac_key) = make_key();
+        let iv = [0u8; 16];
+
+        let cipher = SyncCipher {
+            id: "empty-org-1".to_string(),
+            cipher_type: CIPHER_TYPE_SECURE_NOTE,
+            organization_id: Some(String::new()),
+            name: encrypt_type2(&enc_key, &mac_key, &iv, b"X"),
+            notes: None,
+            login: None,
+            card: None,
+            fields: vec![],
+        };
+
+        let item = decrypt_cipher(&cipher, &key).unwrap();
+        assert_eq!(item.organization_id, None);
     }
 
     #[test]
@@ -446,58 +551,160 @@ mod tests {
 
         let item = decrypt_cipher(&cipher, &key).unwrap();
         assert_eq!(item.name, "PERSONAL_SECRET");
+        assert_eq!(item.organization_id, None);
+    }
+
+    fn make_item(name: &str, org_id: Option<&str>) -> DecryptedItem {
+        DecryptedItem {
+            id: format!("id-{name}-{}", org_id.unwrap_or("personal")),
+            cipher_type: 1,
+            organization_id: org_id.map(str::to_string),
+            name: name.into(),
+            username: String::new(),
+            password: format!("pw-{name}-{}", org_id.unwrap_or("personal")),
+            notes: String::new(),
+            uri: String::new(),
+            fields: HashMap::new(),
+        }
     }
 
     #[test]
     fn test_find_item_exact() {
-        let items = vec![
-            DecryptedItem {
-                id: "1".into(),
-                cipher_type: 1,
-                name: "MySecret".into(),
-                username: String::new(),
-                password: "pw".into(),
-                notes: String::new(),
-                uri: String::new(),
-                fields: HashMap::new(),
-            },
-            DecryptedItem {
-                id: "2".into(),
-                cipher_type: 1,
-                name: "OtherSecret".into(),
-                username: String::new(),
-                password: "other".into(),
-                notes: String::new(),
-                uri: String::new(),
-                fields: HashMap::new(),
-            },
-        ];
+        let items = vec![make_item("MySecret", None), make_item("OtherSecret", None)];
 
-        let found = find_item(&items, "mysecret").unwrap();
+        let found = find_item(&items, "mysecret", None).unwrap();
         assert_eq!(found.name, "MySecret");
     }
 
     #[test]
     fn test_find_item_partial() {
-        let items = vec![DecryptedItem {
-            id: "1".into(),
-            cipher_type: 1,
-            name: "Production API Key".into(),
-            username: String::new(),
-            password: "pw".into(),
-            notes: String::new(),
-            uri: String::new(),
-            fields: HashMap::new(),
-        }];
+        let items = vec![make_item("Production API Key", None)];
 
-        let found = find_item(&items, "api key").unwrap();
+        let found = find_item(&items, "api key", None).unwrap();
         assert_eq!(found.name, "Production API Key");
     }
 
     #[test]
     fn test_find_item_not_found() {
         let items: Vec<DecryptedItem> = vec![];
-        assert!(find_item(&items, "missing").is_none());
+        assert!(find_item(&items, "missing", None).is_none());
+    }
+
+    #[test]
+    fn test_find_item_org_filter_selects_right_copy() {
+        let items = vec![
+            make_item("shared-name", Some("org-a")),
+            make_item("shared-name", Some("org-b")),
+            make_item("shared-name", None),
+        ];
+
+        let found = find_item(&items, "shared-name", Some("org-b")).unwrap();
+        assert_eq!(found.password, "pw-shared-name-org-b");
+    }
+
+    #[test]
+    fn test_find_item_org_filter_excludes_personal() {
+        let items = vec![make_item("only-personal", None)];
+        assert!(find_item(&items, "only-personal", Some("org-a")).is_none());
+    }
+
+    #[test]
+    fn test_find_item_no_filter_matches_org_items() {
+        let items = vec![make_item("org-item", Some("org-a"))];
+        assert!(find_item(&items, "org-item", None).is_some());
+    }
+
+    #[test]
+    fn test_find_item_exact_beats_partial_within_scope() {
+        let items = vec![
+            make_item("api key extended", Some("org-a")),
+            make_item("api key", Some("org-a")),
+        ];
+
+        let found = find_item(&items, "api key", Some("org-a")).unwrap();
+        assert_eq!(found.name, "api key");
+    }
+
+    fn org(id: &str, name: &str) -> SyncOrganization {
+        SyncOrganization {
+            id: id.into(),
+            name: name.into(),
+            key: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_index_orgs_case_insensitive() {
+        let index = index_orgs(&[org("org-1", "Kubernetes - Apollo")]);
+        assert_eq!(
+            index.get("kubernetes - apollo"),
+            Some(&vec!["org-1".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_index_orgs_duplicate_names() {
+        let index = index_orgs(&[org("org-1", "Shared"), org("org-2", "shared")]);
+        assert_eq!(index.get("shared").map(Vec::len), Some(2));
+    }
+
+    fn make_cache() -> VaultCache {
+        VaultCache {
+            items: vec![
+                make_item("shared-name", Some("org-a")),
+                make_item("shared-name", None),
+                make_item("only-in-b", Some("org-b")),
+            ],
+            orgs_by_name: index_orgs(&[
+                org("org-a", "Kubernetes - Apollo"),
+                org("org-b", "Kubernetes - Common"),
+                org("dup-1", "Duplicated"),
+                org("dup-2", "Duplicated"),
+            ]),
+        }
+    }
+
+    #[test]
+    fn test_lookup_item_scoped_success() {
+        let cache = make_cache();
+        let item = lookup_item(&cache, "shared-name", Some("kubernetes - apollo")).unwrap();
+        assert_eq!(item.password, "pw-shared-name-org-a");
+    }
+
+    #[test]
+    fn test_lookup_item_unscoped_success() {
+        let cache = make_cache();
+        assert!(lookup_item(&cache, "only-in-b", None).is_ok());
+    }
+
+    #[test]
+    fn test_lookup_item_vault_not_found() {
+        let cache = make_cache();
+        let err = lookup_item(&cache, "shared-name", Some("no-such-org")).unwrap_err();
+        assert!(matches!(err, LookupError::VaultNotFound(_)), "{err}");
+    }
+
+    #[test]
+    fn test_lookup_item_vault_ambiguous() {
+        let cache = make_cache();
+        let err = lookup_item(&cache, "shared-name", Some("Duplicated")).unwrap_err();
+        assert!(matches!(err, LookupError::VaultAmbiguous(_)), "{err}");
+    }
+
+    #[test]
+    fn test_lookup_item_no_fallback_across_vaults() {
+        // "only-in-b" exists in org-b; a lookup scoped to org-a must fail
+        // rather than fall back to another vault that has the name.
+        let cache = make_cache();
+        let err = lookup_item(&cache, "only-in-b", Some("Kubernetes - Apollo")).unwrap_err();
+        assert!(matches!(err, LookupError::NotFoundInVault { .. }), "{err}");
+    }
+
+    #[test]
+    fn test_lookup_item_unscoped_not_found() {
+        let cache = make_cache();
+        let err = lookup_item(&cache, "missing", None).unwrap_err();
+        assert!(matches!(err, LookupError::NotFound(_)), "{err}");
     }
 
     #[test]
@@ -505,6 +712,7 @@ mod tests {
         let item = DecryptedItem {
             id: "1".into(),
             cipher_type: 1,
+            organization_id: None,
             name: "Test".into(),
             username: String::new(),
             password: "thepassword".into(),
@@ -527,6 +735,7 @@ mod tests {
         let item = DecryptedItem {
             id: "1".into(),
             cipher_type: 2,
+            organization_id: None,
             name: "Test".into(),
             username: String::new(),
             password: String::new(),
@@ -542,6 +751,7 @@ mod tests {
         let item = DecryptedItem {
             id: "1".into(),
             cipher_type: 2,
+            organization_id: None,
             name: "Test".into(),
             username: String::new(),
             password: String::new(),

@@ -20,15 +20,32 @@ metadata:
   name: my-app-secrets
   namespace: my-app
 spec:
-  syncInterval: "5m"   # optional, default 5m
+  syncInterval: "5m"        # optional, default 5m
+  defaultVault: "Kubernetes - Common"  # optional org name to scope all lookups
   data:
-    - key: DATABASE_PASSWORD      # key in the output Secret
-      vaultwardenSecret: "Prod DB" # vault item name (case-insensitive, partial match)
+    - key: DATABASE_PASSWORD   # key in the output Secret
+      secretName: "Prod DB"    # vault item name (case-insensitive, partial match)
+      vault: "Kubernetes Secrets"  # optional per-entry override of defaultVault
     - key: API_KEY
-      vaultwardenSecret: "My API Key"
+      secretName: "My API Key" # uses defaultVault
 ```
 
 This creates a `Secret` named `my-app-secrets` in `my-app` with `DATABASE_PASSWORD` and `API_KEY` populated from vault.
+
+> `vaultwardenSecret` is a deprecated alias for `secretName` and keeps working for existing resources; when both are set, `secretName` wins.
+
+### Vault scoping
+
+`defaultVault` and per-entry `vault` name a Vaultwarden **organization** (case-insensitive exact match). Per-entry `vault` overrides `defaultVault`. Behavior when a vault is set:
+
+- Only items owned by that organization match — personal-vault items are excluded.
+- If the item is not found in that organization, the sync **fails** (Ready=False, `status.lastSyncError` explains) — it never falls back to a same-named item in another vault.
+- A vault name matching multiple organizations is an error; rename one to disambiguate.
+- The substring (partial) match still applies within the scoped organization.
+
+When neither `vault` nor `defaultVault` is set, the item is matched by name across the whole account (personal vault + all organizations), as before.
+
+> **Upgrading:** apply the new CRD before or together with the operator (a `helm upgrade` does both; the `helm.sh/resource-policy: keep` annotation only prevents deletion on uninstall). An old CRD schema silently prunes `secretName`, `vault`, and `defaultVault`.
 
 ### Secret value extraction priority
 

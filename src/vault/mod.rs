@@ -10,7 +10,7 @@ pub mod auth;
 pub mod crypto;
 pub mod sync;
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use reqwest::Client as HttpClient;
 use thiserror::Error;
@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use auth::{authenticate, refresh_token, AuthError};
 use crypto::SymmetricKey;
-use sync::{decrypt_vault, extract_secret, fetch_sync, find_item, SyncError};
+use sync::{decrypt_vault, extract_secret, fetch_sync, lookup_item, LookupError, SyncError};
 
 #[derive(Debug, Error)]
 pub enum VaultError {
@@ -29,10 +29,18 @@ pub enum VaultError {
     Auth(#[from] AuthError),
     #[error("sync error: {0}")]
     Sync(#[from] SyncError),
-    #[error("secret {0:?} not found in vault cache")]
-    NotFound(String),
+    #[error("{0}")]
+    Lookup(#[from] LookupError),
     #[error("vault not yet initialized")]
     NotInitialized,
+}
+
+/// One vault lookup: an item name plus an optional vault (organization) scope.
+#[derive(Debug, Clone)]
+pub struct SecretRequest {
+    pub name: String,
+    /// Organization name to scope the search to; `None` = whole account.
+    pub vault: Option<String>,
 }
 
 /// Shared session state protected by a readers-writer lock.
@@ -43,7 +51,7 @@ struct Session {
     token_expires_at: Instant,
     sym_key: SymmetricKey,
     /// The decrypted vault cache. `None` until the first successful sync.
-    items: Option<Vec<sync::DecryptedItem>>,
+    vault: Option<sync::VaultCache>,
 }
 
 /// The shared Vaultwarden client.
@@ -101,7 +109,7 @@ impl VaultClient {
                 refresh_token: refresh_tok,
                 token_expires_at,
                 sym_key,
-                items: None,
+                vault: None,
             })),
             http,
             base_url,
@@ -118,20 +126,21 @@ impl VaultClient {
         Ok(client)
     }
 
-    /// Return the decrypted values for all requested vault item names.
+    /// Return the decrypted values for all requested lookups, index-aligned
+    /// with `requests`.
     ///
-    /// All-or-nothing: if any name is not found, the entire call fails (no partial writes).
+    /// All-or-nothing: if any lookup fails, the entire call fails (no partial writes).
     pub async fn fetch_secrets(
         &self,
-        names: &[String],
-    ) -> Result<HashMap<String, String>, VaultError> {
+        requests: &[SecretRequest],
+    ) -> Result<Vec<String>, VaultError> {
         let session = self.inner.read().await;
-        let items = session.items.as_deref().ok_or(VaultError::NotInitialized)?;
+        let cache = session.vault.as_ref().ok_or(VaultError::NotInitialized)?;
 
-        let mut result = HashMap::with_capacity(names.len());
-        for name in names {
-            let item = find_item(items, name).ok_or_else(|| VaultError::NotFound(name.clone()))?;
-            result.insert(name.clone(), extract_secret(item).to_string());
+        let mut result = Vec::with_capacity(requests.len());
+        for req in requests {
+            let item = lookup_item(cache, &req.name, req.vault.as_deref())?;
+            result.push(extract_secret(item).to_string());
         }
         Ok(result)
     }
@@ -155,8 +164,8 @@ impl VaultClient {
             Err(e) => return Err(e.into()),
         };
 
-        let items = decrypt_vault(&sync_resp, &sym_key);
-        self.inner.write().await.items = Some(items);
+        let cache = decrypt_vault(&sync_resp, &sym_key);
+        self.inner.write().await.vault = Some(cache);
         debug!("vault cache refreshed");
         Ok(())
     }

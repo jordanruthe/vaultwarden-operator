@@ -46,9 +46,9 @@ Once the operator is running, create a VaultwardenSecret resource:
     syncInterval: "5m"
     data:
       - key: DATABASE_PASSWORD
-        vaultwardenSecret: "Prod DB"
+        secretName: "Prod DB"
       - key: API_KEY
-        vaultwardenSecret: "My API Key"
+        secretName: "My API Key"
   EOF
 
 The operator will write a Kubernetes Secret named my-app-secrets in the my-app

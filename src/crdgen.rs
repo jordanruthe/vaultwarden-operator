@@ -2,6 +2,8 @@
 //!
 //! Usage: `cargo run --bin crdgen > config/crd/vaultwardensecret.yaml`
 
+// This bin only renders the schema; helper methods on the CRD types go unused here.
+#[allow(dead_code)]
 mod crd;
 
 use crd::VaultwardenSecret;

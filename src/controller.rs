@@ -24,8 +24,8 @@ use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    crd::{StatusCondition, VaultwardenSecret, VaultwardenSecretStatus},
-    vault::{VaultClient, VaultError},
+    crd::{StatusCondition, VaultwardenSecret, VaultwardenSecretSpec, VaultwardenSecretStatus},
+    vault::{SecretRequest, VaultClient, VaultError},
 };
 
 const FINALIZER_NAME: &str = "secrets.vaultwarden.io/finalizer";
@@ -91,16 +91,18 @@ async fn reconcile_apply(
         }
     };
 
-    // Collect vault item names.
-    let names: Vec<String> = vws
-        .spec
-        .data
-        .iter()
-        .map(|item| item.vaultwarden_secret.clone())
-        .collect();
+    // Build vault lookup requests from the spec.
+    let requests = match build_requests(&vws.spec) {
+        Ok(r) => r,
+        Err(msg) => {
+            warn!(vws = %name, "invalid spec: {msg}");
+            set_failed_status(&vws, &ctx, &msg).await?;
+            return Ok(Action::requeue(interval));
+        }
+    };
 
-    // All-or-nothing vault fetch.
-    let values = match ctx.vault.fetch_secrets(&names).await {
+    // All-or-nothing vault fetch; results are index-aligned with `requests`.
+    let values = match ctx.vault.fetch_secrets(&requests).await {
         Ok(v) => v,
         Err(e) => {
             let msg = format!("failed to fetch Vaultwarden secrets: {e}");
@@ -111,20 +113,15 @@ async fn reconcile_apply(
     };
 
     // Build Secret data.
+    // Kubernetes Secret data values are base64-encoded; the JSON patch
+    // format expects byte strings when using the `data` field.
+    // We store them as plain strings in `stringData` to avoid double-encoding.
     let secret_data: BTreeMap<String, serde_json::Value> = vws
         .spec
         .data
         .iter()
-        .map(|item| {
-            let value = values
-                .get(&item.vaultwarden_secret)
-                .cloned()
-                .unwrap_or_default();
-            // Kubernetes Secret data values are base64-encoded; the JSON patch
-            // format expects byte strings when using the `data` field.
-            // We store them as plain strings in `stringData` to avoid double-encoding.
-            (item.key.clone(), json!(value))
-        })
+        .zip(values.iter())
+        .map(|(item, value)| (item.key.clone(), json!(value)))
         .collect();
 
     // CreateOrUpdate the managed Secret.
@@ -313,6 +310,48 @@ fn upsert_condition(conditions: &mut Vec<StatusCondition>, new: StatusCondition)
 // Interval parsing
 // ---------------------------------------------------------------------------
 
+/// Build vault lookup requests from the spec.
+///
+/// Per entry: `secretName` is preferred over the deprecated `vaultwardenSecret`;
+/// the entry's `vault` overrides `spec.defaultVault`; empty strings are unset.
+/// `Err` carries a user-facing validation message.
+fn build_requests(spec: &VaultwardenSecretSpec) -> Result<Vec<SecretRequest>, String> {
+    let default_vault = spec.default_vault.as_deref().filter(|v| !v.is_empty());
+
+    spec.data
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let name = item.resolved_secret_name().ok_or_else(|| {
+                format!(
+                    "spec.data[{i}] (key {:?}): one of secretName or vaultwardenSecret must be set",
+                    item.key
+                )
+            })?;
+            if let (Some(new), Some(old)) = (
+                item.secret_name.as_deref(),
+                item.vaultwarden_secret.as_deref(),
+            ) {
+                if !new.is_empty() && !old.is_empty() && new != old {
+                    warn!(
+                        key = %item.key,
+                        "both secretName and vaultwardenSecret set and differ; using secretName"
+                    );
+                }
+            }
+            let vault = item
+                .vault
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .or(default_vault);
+            Ok(SecretRequest {
+                name: name.to_string(),
+                vault: vault.map(str::to_string),
+            })
+        })
+        .collect()
+}
+
 /// Parse a Go-style duration string (`"5m"`, `"1h30m"`, etc.) into a `Duration`.
 ///
 /// Empty string → default 5 minutes. Must be positive.
@@ -429,5 +468,83 @@ mod tests {
     fn test_parse_sync_interval_invalid() {
         assert!(parse_sync_interval("abc").is_err());
         assert!(parse_sync_interval("5x").is_err());
+    }
+
+    fn spec(yaml: &str) -> VaultwardenSecretSpec {
+        serde_yaml::from_str(yaml).expect("valid spec yaml")
+    }
+
+    #[test]
+    fn test_build_requests_entry_vault_overrides_default() {
+        let s = spec(
+            "defaultVault: Common\n\
+             data:\n\
+             - key: a\n  secretName: item-a\n  vault: Apollo\n",
+        );
+        let reqs = build_requests(&s).unwrap();
+        assert_eq!(reqs[0].vault.as_deref(), Some("Apollo"));
+    }
+
+    #[test]
+    fn test_build_requests_inherits_default_vault() {
+        let s = spec(
+            "defaultVault: Common\n\
+             data:\n\
+             - key: a\n  secretName: item-a\n",
+        );
+        let reqs = build_requests(&s).unwrap();
+        assert_eq!(reqs[0].vault.as_deref(), Some("Common"));
+    }
+
+    #[test]
+    fn test_build_requests_no_vault() {
+        let s = spec("data:\n- key: a\n  secretName: item-a\n");
+        let reqs = build_requests(&s).unwrap();
+        assert_eq!(reqs[0].vault, None);
+        assert_eq!(reqs[0].name, "item-a");
+    }
+
+    #[test]
+    fn test_build_requests_legacy_field() {
+        let s = spec("data:\n- key: a\n  vaultwardenSecret: legacy-item\n");
+        let reqs = build_requests(&s).unwrap();
+        assert_eq!(reqs[0].name, "legacy-item");
+    }
+
+    #[test]
+    fn test_build_requests_secret_name_wins_over_legacy() {
+        let s = spec("data:\n- key: a\n  secretName: new\n  vaultwardenSecret: old\n");
+        let reqs = build_requests(&s).unwrap();
+        assert_eq!(reqs[0].name, "new");
+    }
+
+    #[test]
+    fn test_build_requests_missing_name_errors() {
+        let s = spec("data:\n- key: a\n  secretName: item-a\n- key: b\n");
+        let err = build_requests(&s).unwrap_err();
+        assert!(err.contains("spec.data[1]"), "{err}");
+        assert!(err.contains("\"b\""), "{err}");
+    }
+
+    #[test]
+    fn test_build_requests_empty_strings_unset() {
+        let s = spec(
+            "defaultVault: \"\"\n\
+             data:\n\
+             - key: a\n  secretName: item-a\n  vault: \"\"\n",
+        );
+        let reqs = build_requests(&s).unwrap();
+        assert_eq!(reqs[0].vault, None);
+    }
+
+    #[test]
+    fn test_build_requests_empty_entry_vault_inherits_default() {
+        let s = spec(
+            "defaultVault: Common\n\
+             data:\n\
+             - key: a\n  secretName: item-a\n  vault: \"\"\n",
+        );
+        let reqs = build_requests(&s).unwrap();
+        assert_eq!(reqs[0].vault.as_deref(), Some("Common"));
     }
 }

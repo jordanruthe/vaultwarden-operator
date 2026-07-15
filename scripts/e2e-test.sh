@@ -3,14 +3,20 @@
 # cluster with a throwaway Vaultwarden, deploys the real Helm chart in HA
 # (replicaCount=2), and verifies:
 #   1. the happy path (reconcile produces the expected Secret) using
-#      password auth (VAULTWARDEN_EMAIL/PASSWORD)
-#   2. leader failover (killing the leader hands off within the lease TTL and
+#      password auth (VAULTWARDEN_EMAIL/PASSWORD), covering both the
+#      `secretName` field and its deprecated `vaultwardenSecret` alias
+#   2. vault (organization) scoping: an org and a same-named personal item
+#      with different values are seeded; a CR using `defaultVault`
+#      (case-insensitively) and a per-entry `vault` override must resolve the
+#      org copy, and a CR scoped to a nonexistent vault must fail its sync
+#      (Ready=false, lastSyncError set, no Secret written)
+#   3. leader failover (killing the leader hands off within the lease TTL and
 #      reconciliation resumes under the new leader)
-#   3. API-key auth: fetches a personal API key for the test account and
+#   4. API-key auth: fetches a personal API key for the test account and
 #      restarts the operator with VAULTWARDEN_CLIENT_ID/CLIENT_SECRET wired
 #      in (the chart's `extraEnv` mechanism), confirming it still
 #      authenticates and reconciles
-#   4. the RBAC-gap failure mode: if the `leases` ClusterRole rule is missing,
+#   5. the RBAC-gap failure mode: if the `leases` ClusterRole rule is missing,
 #      every pod passes health probes but never reconciles (silent stall) --
 #      this documents the symptom to watch for if RBAC lags the image during
 #      a real rollout.
@@ -36,6 +42,7 @@ IMAGE_TAG="vaultwarden-operator:e2e"
 TEST_EMAIL="test@example.com"
 TEST_NAME="Test User"
 TEST_PASSWORD="CorrectHorseBatteryStaple1!"
+ORG_NAME="Kubernetes Secrets"
 VW_HTTP_PORT=8380
 TLS_PROXY_PORT=8443
 
@@ -222,6 +229,33 @@ EOF
   encoded="$(NODE_TLS_REJECT_UNAUTHORIZED=0 bw encode <"$item_json")"
   NODE_TLS_REJECT_UNAUTHORIZED=0 bw create item "$encoded" >/dev/null
   ITEM_ID="$(NODE_TLS_REJECT_UNAUTHORIZED=0 bw list items --search test-secret | python3 -c 'import json,sys;print(json.load(sys.stdin)[0]["id"])')"
+
+  # -- Vault (organization) scoping fixtures ---------------------------------
+  # Create an organization and seed the SAME item name into both the org and
+  # the personal vault with different values, so the scoped test can prove the
+  # operator picks the org copy and never falls back across vaults.
+  log "Creating organization '$ORG_NAME' via web vault"
+  node "$E2E_DIR/create-org.js" "https://127.0.0.1:${TLS_PROXY_PORT}" "$TEST_EMAIL" "$TEST_PASSWORD" "$ORG_NAME"
+
+  log "Seeding org-scoped and colliding personal vault items"
+  NODE_TLS_REJECT_UNAUTHORIZED=0 bw sync >/dev/null
+  local org_id coll_id
+  org_id="$(NODE_TLS_REJECT_UNAUTHORIZED=0 bw list organizations \
+    | python3 -c 'import json,sys;orgs=json.load(sys.stdin);print(next(o["id"] for o in orgs if o["name"]=="'"$ORG_NAME"'"))')"
+  coll_id="$(NODE_TLS_REJECT_UNAUTHORIZED=0 bw list org-collections --organizationid "$org_id" \
+    | python3 -c 'import json,sys;print(json.load(sys.stdin)[0]["id"])')"
+
+  cat >"$item_json" <<EOF
+{"organizationId":"$org_id","collectionIds":["$coll_id"],"folderId":null,"type":1,"name":"scoped-secret","notes":null,"favorite":false,"reprompt":0,"login":{"username":"orguser","password":"org-value-999","totp":null,"uris":[]},"fields":[],"passwordHistory":[]}
+EOF
+  encoded="$(NODE_TLS_REJECT_UNAUTHORIZED=0 bw encode <"$item_json")"
+  NODE_TLS_REJECT_UNAUTHORIZED=0 bw create item "$encoded" >/dev/null
+
+  cat >"$item_json" <<EOF
+{"organizationId":null,"folderId":null,"type":1,"name":"scoped-secret","notes":null,"favorite":false,"reprompt":0,"login":{"username":"personaluser","password":"personal-value-111","totp":null,"uris":[]},"fields":[],"passwordHistory":[]}
+EOF
+  encoded="$(NODE_TLS_REJECT_UNAUTHORIZED=0 bw encode <"$item_json")"
+  NODE_TLS_REJECT_UNAUTHORIZED=0 bw create item "$encoded" >/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -257,6 +291,9 @@ spec:
   syncInterval: "5m"
   data:
     - key: password
+      secretName: test-secret
+    # Legacy spelling must keep working (deprecated alias for secretName).
+    - key: password_legacy
       vaultwardenSecret: test-secret
 EOF
 }
@@ -282,7 +319,92 @@ step_verify_happy_path() {
 
   value="$(kubectl -n app-test get secret test-secret -o jsonpath='{.data.password}' | base64 -d)"
   [ "$value" = "s3cr3t-value-123" ] || die "unexpected secret value: $value"
-  log "happy path OK (secret value matches seeded vault item)"
+
+  # The legacy vaultwardenSecret spelling must resolve to the same item.
+  value="$(kubectl -n app-test get secret test-secret -o jsonpath='{.data.password_legacy}' | base64 -d)"
+  [ "$value" = "s3cr3t-value-123" ] || die "unexpected legacy-field secret value: $value"
+  log "happy path OK (secretName and legacy vaultwardenSecret both match seeded vault item)"
+}
+
+# ---------------------------------------------------------------------------
+# Step: vault (organization) scoping
+# ---------------------------------------------------------------------------
+step_verify_vault_scoping() {
+  log "Verifying vault-scoped lookups pick the org copy over a same-named personal item"
+  # defaultVault is deliberately lowercased to prove case-insensitive matching;
+  # the second entry proves the per-entry vault override path.
+  kubectl apply -n app-test -f - >/dev/null <<EOF
+apiVersion: secrets.vaultwarden.io/v1alpha1
+kind: VaultwardenSecret
+metadata:
+  name: test-secret-scoped
+  namespace: app-test
+spec:
+  syncInterval: "5m"
+  defaultVault: "$(echo "$ORG_NAME" | tr '[:upper:]' '[:lower:]')"
+  data:
+    - key: inherited
+      secretName: scoped-secret
+    - key: explicit
+      secretName: scoped-secret
+      vault: "$ORG_NAME"
+EOF
+
+  for _ in $(seq 1 20); do
+    kubectl -n app-test get secret test-secret-scoped >/dev/null 2>&1 && break
+    sleep 1
+  done
+
+  local ready value
+  ready="$(kubectl -n app-test get vaultwardensecret test-secret-scoped -o jsonpath='{.status.ready}')"
+  [ "$ready" = "true" ] || die "scoped VaultwardenSecret status.ready != true (got: $ready; lastSyncError: $(kubectl -n app-test get vaultwardensecret test-secret-scoped -o jsonpath='{.status.lastSyncError}'))"
+
+  value="$(kubectl -n app-test get secret test-secret-scoped -o jsonpath='{.data.inherited}' | base64 -d)"
+  [ "$value" = "org-value-999" ] || die "defaultVault-scoped lookup returned wrong copy: $value (personal collision value is personal-value-111)"
+
+  value="$(kubectl -n app-test get secret test-secret-scoped -o jsonpath='{.data.explicit}' | base64 -d)"
+  [ "$value" = "org-value-999" ] || die "vault-override lookup returned wrong copy: $value"
+
+  log "vault scoping OK (org copy selected via defaultVault and per-entry vault; personal collision ignored)"
+}
+
+# ---------------------------------------------------------------------------
+# Step: vault scoping negative test
+# ---------------------------------------------------------------------------
+step_verify_vault_scoping_negative() {
+  log "Verifying that a lookup scoped to a nonexistent vault fails the sync"
+  kubectl apply -n app-test -f - >/dev/null <<'EOF'
+apiVersion: secrets.vaultwarden.io/v1alpha1
+kind: VaultwardenSecret
+metadata:
+  name: test-secret-badvault
+  namespace: app-test
+spec:
+  syncInterval: "5m"
+  data:
+    - key: password
+      secretName: test-secret
+      vault: no-such-org
+EOF
+
+  local err=""
+  for _ in $(seq 1 20); do
+    err="$(kubectl -n app-test get vaultwardensecret test-secret-badvault -o jsonpath='{.status.lastSyncError}' 2>/dev/null || true)"
+    [ -n "$err" ] && break
+    sleep 1
+  done
+  echo "$err" | grep -q 'vault (organization) "no-such-org" not found' \
+    || die "expected vault-not-found error in lastSyncError, got: $err"
+
+  local ready
+  ready="$(kubectl -n app-test get vaultwardensecret test-secret-badvault -o jsonpath='{.status.ready}')"
+  [ "$ready" != "true" ] || die "VaultwardenSecret with bad vault became ready"
+
+  kubectl -n app-test get secret test-secret-badvault >/dev/null 2>&1 \
+    && die "managed Secret was created despite the failed vault-scoped lookup"
+
+  kubectl -n app-test delete vaultwardensecret test-secret-badvault --wait=false >/dev/null
+  log "vault scoping negative test OK (sync failed, no Secret written)"
 }
 
 # ---------------------------------------------------------------------------
@@ -454,6 +576,8 @@ main() {
   step_vaultwarden
   step_deploy_operator
   step_verify_happy_path
+  step_verify_vault_scoping
+  step_verify_vault_scoping_negative
   step_verify_failover
   step_verify_api_key_auth
   step_verify_rbac_gap
