@@ -10,13 +10,19 @@
 #      (case-insensitively) and a per-entry `vault` override must resolve the
 #      org copy, and a CR scoped to a nonexistent vault must fail its sync
 #      (Ready=false, lastSyncError set, no Secret written)
-#   3. leader failover (killing the leader hands off within the lease TTL and
+#   3. status.lastSyncError actually clears once a previously-failing CR
+#      starts succeeding, rather than sticking around forever (regression
+#      test for a JSON-merge-patch bug)
+#   4. refresh-on-miss: a CR referencing a not-yet-existing vault item fails,
+#      then becomes ready shortly after the item is created -- without
+#      waiting for the ~5min background cache refresh
+#   5. leader failover (killing the leader hands off within the lease TTL and
 #      reconciliation resumes under the new leader)
-#   4. API-key auth: fetches a personal API key for the test account and
+#   6. API-key auth: fetches a personal API key for the test account and
 #      restarts the operator with VAULTWARDEN_CLIENT_ID/CLIENT_SECRET wired
 #      in (the chart's `extraEnv` mechanism), confirming it still
 #      authenticates and reconciles
-#   5. the RBAC-gap failure mode: if the `leases` ClusterRole rule is missing,
+#   7. the RBAC-gap failure mode: if the `leases` ClusterRole rule is missing,
 #      every pod passes health probes but never reconciles (silent stall) --
 #      this documents the symptom to watch for if RBAC lags the image during
 #      a real rollout.
@@ -403,8 +409,100 @@ EOF
   kubectl -n app-test get secret test-secret-badvault >/dev/null 2>&1 \
     && die "managed Secret was created despite the failed vault-scoped lookup"
 
-  kubectl -n app-test delete vaultwardensecret test-secret-badvault --wait=false >/dev/null
   log "vault scoping negative test OK (sync failed, no Secret written)"
+  # test-secret-badvault is left in place (Ready=false, lastSyncError set) for
+  # step_verify_status_error_clears, which fixes it and confirms the stale
+  # error is cleared rather than surviving forever.
+}
+
+# ---------------------------------------------------------------------------
+# Step: status.lastSyncError clears on a subsequent successful sync
+#
+# Regression test: a JSON merge patch that omits a key leaves the existing
+# server-side value alone, so a status struct that serializes an empty
+# lastSyncError as "absent" (via skip_serializing_if) never actually clears
+# it. This fixes test-secret-badvault (left failing by the previous step)
+# and confirms lastSyncError is gone, not just stale, once the sync succeeds.
+# ---------------------------------------------------------------------------
+step_verify_status_error_clears() {
+  log "Verifying status.lastSyncError clears once a failing VaultwardenSecret starts succeeding"
+
+  kubectl -n app-test patch vaultwardensecret test-secret-badvault --type=merge \
+    -p '{"spec":{"data":[{"key":"password","secretName":"test-secret"}]}}' >/dev/null
+
+  local ready err
+  ready="false"
+  for _ in $(seq 1 30); do
+    ready="$(kubectl -n app-test get vaultwardensecret test-secret-badvault -o jsonpath='{.status.ready}' 2>/dev/null || true)"
+    [ "$ready" = "true" ] && break
+    sleep 1
+  done
+  [ "$ready" = "true" ] || die "test-secret-badvault never became ready after fixing its vault scope"
+
+  err="$(kubectl -n app-test get vaultwardensecret test-secret-badvault -o jsonpath='{.status.lastSyncError}' 2>/dev/null || true)"
+  [ -z "$err" ] || die "status.lastSyncError is still set after a successful sync: $err"
+
+  local value
+  value="$(kubectl -n app-test get secret test-secret-badvault -o jsonpath='{.data.password}' | base64 -d)"
+  [ "$value" = "s3cr3t-value-123" ] || die "unexpected secret value after fixing vault scope: $value"
+
+  kubectl -n app-test delete vaultwardensecret test-secret-badvault --wait=false >/dev/null
+  log "status.lastSyncError clears OK (no longer sticks around after the sync that fixed it)"
+}
+
+# ---------------------------------------------------------------------------
+# Step: refresh-on-miss
+#
+# A cache miss triggers one on-demand vault re-sync (subject to a cooldown)
+# before failing, so a just-created vault item becomes visible without
+# waiting for the ~5min background refresh. Uses a short syncInterval so the
+# reconciler retries often enough to observe the on-demand refresh land.
+# ---------------------------------------------------------------------------
+step_verify_refresh_on_miss() {
+  log "Verifying a cache miss triggers an on-demand refresh instead of waiting for the background timer"
+
+  kubectl apply -n app-test -f - >/dev/null <<'EOF'
+apiVersion: secrets.vaultwarden.io/v1alpha1
+kind: VaultwardenSecret
+metadata:
+  name: test-secret-refresh-miss
+  namespace: app-test
+spec:
+  syncInterval: "10s"
+  data:
+    - key: password
+      secretName: refresh-miss-secret
+EOF
+
+  local err=""
+  for _ in $(seq 1 20); do
+    err="$(kubectl -n app-test get vaultwardensecret test-secret-refresh-miss -o jsonpath='{.status.lastSyncError}' 2>/dev/null || true)"
+    [ -n "$err" ] && break
+    sleep 1
+  done
+  [ -n "$err" ] || die "expected an initial cache-miss failure for test-secret-refresh-miss, got none"
+
+  log "Creating the previously-missing vault item"
+  local item_json="$WORKDIR/refresh-miss-item.json"
+  cat >"$item_json" <<EOF
+{"organizationId":null,"folderId":null,"type":1,"name":"refresh-miss-secret","notes":null,"favorite":false,"reprompt":0,"login":{"username":"refreshuser","password":"refresh-value-789","totp":null,"uris":[]},"fields":[],"passwordHistory":[]}
+EOF
+  local encoded
+  encoded="$(NODE_TLS_REJECT_UNAUTHORIZED=0 bw encode <"$item_json")"
+  NODE_TLS_REJECT_UNAUTHORIZED=0 bw create item "$encoded" >/dev/null
+
+  # Well under the ~5min background refresh interval, but comfortably past the
+  # ~30s on-demand refresh cooldown plus a couple of 10s reconcile retries.
+  local value=""
+  for _ in $(seq 1 120); do
+    value="$(kubectl -n app-test get secret test-secret-refresh-miss -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+    [ "$value" = "refresh-value-789" ] && break
+    sleep 1
+  done
+  [ "$value" = "refresh-value-789" ] || die "recreated vault item did not become visible via on-demand refresh (got: $value)"
+
+  kubectl -n app-test delete vaultwardensecret test-secret-refresh-miss --wait=false >/dev/null
+  log "refresh-on-miss OK (recreated item became visible without waiting for the background refresh)"
 }
 
 # ---------------------------------------------------------------------------
@@ -578,6 +676,8 @@ main() {
   step_verify_happy_path
   step_verify_vault_scoping
   step_verify_vault_scoping_negative
+  step_verify_status_error_clears
+  step_verify_refresh_on_miss
   step_verify_failover
   step_verify_api_key_auth
   step_verify_rbac_gap

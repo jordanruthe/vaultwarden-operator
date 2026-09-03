@@ -64,6 +64,11 @@ spec:
             #       key: VAULTWARDEN_CLIENT_SECRET
             - name: RUST_LOG
               value: "info"
+            # Optional: override the vault cache refresh intervals (defaults: 5m / 30s)
+            # - name: VAULT_CACHE_REFRESH_INTERVAL
+            #   value: "5m"
+            # - name: VAULT_CACHE_MIN_REFRESH_INTERVAL
+            #   value: "30s"
           ports:
             - name: health
               containerPort: 8081

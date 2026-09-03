@@ -12,6 +12,7 @@
 
 mod controller;
 mod crd;
+mod duration;
 mod health;
 mod leader;
 mod vault;
@@ -24,16 +25,41 @@ use kube::{
     runtime::{controller::Controller, predicates, reflector, watcher, Predicate, WatchStreamExt},
     Client,
 };
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use controller::{error_policy, reconcile, Context};
 use crd::VaultwardenSecret;
 use vault::initialize_vault_client;
 
-/// Vault cache refresh interval. Reconciles read the in-memory cache; this
+/// Default vault cache refresh interval. Reconciles read the in-memory cache; this
 /// controls how fresh that cache is (independent of per-CR `spec.syncInterval`).
-const VAULT_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Overridable via `VAULT_CACHE_REFRESH_INTERVAL`.
+const DEFAULT_VAULT_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Default cooldown between on-demand vault re-syncs triggered by a cache miss.
+/// Overridable via `VAULT_CACHE_MIN_REFRESH_INTERVAL`.
+const DEFAULT_VAULT_CACHE_MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Read a duration from an environment variable, falling back to `default` when the
+/// variable is unset, empty, or fails to parse (a parse failure is logged and does not
+/// prevent startup).
+fn env_duration(key: &str, default: Duration) -> Duration {
+    match std::env::var(key) {
+        Ok(v) if !v.is_empty() => match duration::parse_duration(&v) {
+            Ok(d) if !d.is_zero() => d,
+            Ok(_) => {
+                warn!(key, value = %v, "duration must be positive; using default");
+                default
+            }
+            Err(e) => {
+                warn!(key, value = %v, err = %e, "invalid duration; using default");
+                default
+            }
+        },
+        _ => default,
+    }
+}
 
 fn required_env(key: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| {
@@ -94,6 +120,20 @@ async fn main() -> anyhow::Result<()> {
     let client_id = optional_env("VAULTWARDEN_CLIENT_ID");
     let client_secret = optional_env("VAULTWARDEN_CLIENT_SECRET");
 
+    let cache_refresh_interval = env_duration(
+        "VAULT_CACHE_REFRESH_INTERVAL",
+        DEFAULT_VAULT_CACHE_REFRESH_INTERVAL,
+    );
+    let cache_min_refresh_interval = env_duration(
+        "VAULT_CACHE_MIN_REFRESH_INTERVAL",
+        DEFAULT_VAULT_CACHE_MIN_REFRESH_INTERVAL,
+    );
+    info!(
+        ?cache_refresh_interval,
+        ?cache_min_refresh_interval,
+        "vault cache refresh intervals configured"
+    );
+
     // ---------------------------------------------------------------------------
     // Vault client init (fails fast → process exits if Vaultwarden is unreachable)
     // ---------------------------------------------------------------------------
@@ -103,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
         &vault_password,
         client_id,
         client_secret,
+        cache_min_refresh_interval,
     )
     .await?;
 
@@ -124,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
     let cache_rx = shutdown_rx.clone();
     tokio::spawn(async move {
         vc_cache
-            .start_vault_cache_refresh(VAULT_CACHE_REFRESH_INTERVAL, cache_rx)
+            .start_vault_cache_refresh(cache_refresh_interval, cache_rx)
             .await;
     });
 

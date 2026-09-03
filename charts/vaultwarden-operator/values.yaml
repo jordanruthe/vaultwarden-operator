@@ -39,6 +39,20 @@ rbac:
 credentials:
   existingSecret: "vaultwarden-operator-credentials"
 
+vault:
+  # -- How often the operator re-syncs the entire vault from Vaultwarden in the
+  # background (Go-style duration string, e.g. "5m", "1h"). Independent of each
+  # VaultwardenSecret's own spec.syncInterval, which only controls how often the
+  # already-cached data is re-applied to the managed Secret. Empty uses the
+  # operator's built-in default (5m).
+  cacheRefreshInterval: ""
+  # -- Minimum time between on-demand vault re-syncs triggered by a cache miss
+  # (e.g. a VaultwardenSecret referencing an item that was just created or moved).
+  # Lower this to make newly created items visible sooner; raise it to reduce
+  # load on Vaultwarden if many VaultwardenSecrets fail at once. Empty uses the
+  # operator's built-in default (30s).
+  minRefreshInterval: ""
+
 # -- Static environment variables added to the operator container.
 env:
   RUST_LOG: "info"

@@ -139,6 +139,26 @@ pub struct VaultCache {
     pub orgs_by_name: HashMap<String, Vec<String>>,
 }
 
+/// Counts of ciphers dropped while decrypting a sync response, for diagnostics.
+///
+/// Neither case is visible to a scoped or unscoped lookup — the org still resolves
+/// by name (`VaultCache::orgs_by_name`), it just has no items — so a caller logs
+/// this alongside the decrypted item count to distinguish "cache is broken" from
+/// "the name is simply wrong".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DecryptSkips {
+    /// Ciphers skipped because their organization's key was missing or failed to decrypt.
+    pub no_org_key: usize,
+    /// Ciphers skipped because the cipher itself failed to decrypt (e.g. bad name field).
+    pub decrypt_failed: usize,
+}
+
+impl DecryptSkips {
+    pub fn total(&self) -> usize {
+        self.no_org_key + self.decrypt_failed
+    }
+}
+
 /// Errors from a vault-scoped item lookup.
 #[derive(Debug, Error)]
 pub enum LookupError {
@@ -146,10 +166,25 @@ pub enum LookupError {
     VaultNotFound(String),
     #[error("vault name {0:?} matches multiple organizations; use a unique name")]
     VaultAmbiguous(String),
-    #[error("secret {name:?} not found in vault {vault:?}")]
-    NotFoundInVault { name: String, vault: String },
-    #[error("secret {0:?} not found in vault cache")]
-    NotFound(String),
+    #[error("secret {name:?} not found in vault {vault:?} ({searched} items searched)")]
+    NotFoundInVault {
+        name: String,
+        vault: String,
+        searched: usize,
+    },
+    #[error("secret {name:?} not found in vault cache ({searched} items searched)")]
+    NotFound { name: String, searched: usize },
+}
+
+impl LookupError {
+    /// Whether this error indicates the cache may simply be stale (item recently
+    /// created/moved, organization recently added) rather than a permanent
+    /// configuration problem. Staleness-class errors are worth retrying after an
+    /// on-demand re-sync; `VaultAmbiguous` is a naming conflict that a re-sync
+    /// cannot fix.
+    pub fn is_stale_miss(&self) -> bool {
+        !matches!(self, LookupError::VaultAmbiguous(_))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +233,10 @@ pub fn index_orgs(orgs: &[SyncOrganization]) -> HashMap<String, Vec<String>> {
 
 /// Decrypt all ciphers in a sync response using the user's symmetric key
 /// and any organisation keys derived from the user's RSA private key.
-pub fn decrypt_vault(sync: &SyncResponse, sym_key: &SymmetricKey) -> VaultCache {
+///
+/// Returns the cache alongside counts of ciphers that were silently dropped, so
+/// callers can log a summary instead of leaving misses undiagnosable.
+pub fn decrypt_vault(sync: &SyncResponse, sym_key: &SymmetricKey) -> (VaultCache, DecryptSkips) {
     // Decrypt org keys if we have a private key.
     let mut org_keys: HashMap<String, SymmetricKey> = HashMap::new();
     if !sync.profile.organizations.is_empty() && !sync.profile.private_key.is_empty() {
@@ -222,6 +260,7 @@ pub fn decrypt_vault(sync: &SyncResponse, sym_key: &SymmetricKey) -> VaultCache 
     }
 
     let mut items = Vec::with_capacity(sync.ciphers.len());
+    let mut skips = DecryptSkips::default();
     for cipher in &sync.ciphers {
         let key = if let Some(org_id) = &cipher.organization_id {
             if org_id.is_empty() {
@@ -230,6 +269,7 @@ pub fn decrypt_vault(sync: &SyncResponse, sym_key: &SymmetricKey) -> VaultCache 
                 k
             } else {
                 debug!(cipher_id = %cipher.id, org_id = %org_id, "no org key; skipping cipher");
+                skips.no_org_key += 1;
                 continue;
             }
         } else {
@@ -239,16 +279,29 @@ pub fn decrypt_vault(sync: &SyncResponse, sym_key: &SymmetricKey) -> VaultCache 
         match decrypt_cipher(cipher, key) {
             Ok(item) => items.push(item),
             Err(e) => {
-                debug!(cipher_id = %cipher.id, err = %e, "failed to decrypt cipher; skipping")
+                debug!(cipher_id = %cipher.id, err = %e, "failed to decrypt cipher; skipping");
+                skips.decrypt_failed += 1;
             }
         }
     }
 
+    if skips.total() > 0 {
+        warn!(
+            no_org_key = skips.no_org_key,
+            decrypt_failed = skips.decrypt_failed,
+            decrypted = items.len(),
+            total_ciphers = sync.ciphers.len(),
+            "some ciphers were dropped while decrypting the vault; \
+             affected organizations' items will report as \"not found\""
+        );
+    }
     debug!(count = items.len(), "decrypted vault items");
-    VaultCache {
+
+    let cache = VaultCache {
         items,
         orgs_by_name: index_orgs(&sync.profile.organizations),
-    }
+    };
+    (cache, skips)
 }
 
 /// Decrypt a single cipher into a `DecryptedItem`.
@@ -376,11 +429,14 @@ pub fn lookup_item<'a>(
                 LookupError::NotFoundInVault {
                     name: name.to_string(),
                     vault: v.to_string(),
+                    searched: cache.items.len(),
                 }
             })
         }
-        None => find_item(&cache.items, name, None)
-            .ok_or_else(|| LookupError::NotFound(name.to_string())),
+        None => find_item(&cache.items, name, None).ok_or_else(|| LookupError::NotFound {
+            name: name.to_string(),
+            searched: cache.items.len(),
+        }),
     }
 }
 
@@ -704,7 +760,62 @@ mod tests {
     fn test_lookup_item_unscoped_not_found() {
         let cache = make_cache();
         let err = lookup_item(&cache, "missing", None).unwrap_err();
-        assert!(matches!(err, LookupError::NotFound(_)), "{err}");
+        assert!(matches!(err, LookupError::NotFound { .. }), "{err}");
+    }
+
+    #[test]
+    fn test_is_stale_miss_classification() {
+        assert!(LookupError::NotFound {
+            name: "x".into(),
+            searched: 0
+        }
+        .is_stale_miss());
+        assert!(LookupError::NotFoundInVault {
+            name: "x".into(),
+            vault: "v".into(),
+            searched: 0
+        }
+        .is_stale_miss());
+        assert!(LookupError::VaultNotFound("v".into()).is_stale_miss());
+        assert!(!LookupError::VaultAmbiguous("v".into()).is_stale_miss());
+    }
+
+    #[test]
+    fn test_decrypt_vault_counts_missing_org_key_skips() {
+        let (personal_key, _, _) = make_key();
+        let iv = [7u8; 16];
+        let org_id = "org-missing-key".to_string();
+
+        let enc_name = encrypt_type2(&[9u8; 32], &[9u8; 32], &iv, b"ORPHANED");
+        let cipher = SyncCipher {
+            id: "cipher-orphan".to_string(),
+            cipher_type: CIPHER_TYPE_LOGIN,
+            organization_id: Some(org_id.clone()),
+            name: enc_name,
+            notes: None,
+            login: None,
+            card: None,
+            fields: vec![],
+        };
+
+        let sync = SyncResponse {
+            profile: SyncProfile {
+                id: "u1".into(),
+                email: "u@example.com".into(),
+                key: String::new(),
+                private_key: String::new(),
+                organizations: vec![org(&org_id, "Orphaned Org")],
+            },
+            ciphers: vec![cipher],
+        };
+
+        let (cache, skips) = decrypt_vault(&sync, &personal_key);
+        assert_eq!(skips.no_org_key, 1);
+        assert_eq!(skips.decrypt_failed, 0);
+        assert_eq!(skips.total(), 1);
+        assert!(cache.items.is_empty());
+        // The org still resolves by name even though its items were dropped.
+        assert!(cache.orgs_by_name.contains_key("orphaned org"));
     }
 
     #[test]

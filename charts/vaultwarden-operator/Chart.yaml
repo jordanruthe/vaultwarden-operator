@@ -4,8 +4,8 @@ description: >
   A Kubernetes operator that syncs secrets from a Vaultwarden (self-hosted Bitwarden)
   instance into native Kubernetes Secret objects using client-side Bitwarden crypto.
 type: application
-version: 0.1.2
-appVersion: "0.1.2"
+version: 0.1.3
+appVersion: "0.1.3"
 kubeVersion: ">=1.21.0-0"
 
 keywords:

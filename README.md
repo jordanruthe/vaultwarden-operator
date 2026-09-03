@@ -47,6 +47,27 @@ When neither `vault` nor `defaultVault` is set, the item is matched by name acro
 
 > **Upgrading:** apply the new CRD before or together with the operator (a `helm upgrade` does both; the `helm.sh/resource-policy: keep` annotation only prevents deletion on uninstall). An old CRD schema silently prunes `secretName`, `vault`, and `defaultVault`.
 
+### Vault cache refresh
+
+Reconciles never hit Vaultwarden directly — they read an in-memory cache that is
+re-synced in the background. Two intervals control this, both set as environment
+variables on the operator (see `vault.cacheRefreshInterval` / `vault.minRefreshInterval`
+in the Helm chart's `values.yaml`):
+
+- `VAULT_CACHE_REFRESH_INTERVAL` (default `5m`) — how often the whole vault is
+  re-fetched in the background. This is independent of each CR's own `syncInterval`,
+  which only controls how often the *already-cached* data is re-applied to the
+  managed `Secret`.
+- `VAULT_CACHE_MIN_REFRESH_INTERVAL` (default `30s`) — when a lookup misses (the item
+  isn't in the cache, or names a vault the cache doesn't know about yet), the operator
+  triggers one on-demand re-sync and retries before failing, so a just-created or
+  just-moved item can become visible in seconds rather than waiting for the next
+  background refresh. This cooldown caps how often that on-demand refresh can fire,
+  so a batch of CRs failing at once collapses into a single extra `/api/sync` call.
+
+A vault name matching multiple organizations (`VaultAmbiguous`) is a naming conflict,
+not staleness, so it fails immediately without triggering a refresh.
+
 ### Secret value extraction priority
 
 For each vault item, the operator extracts the value using this priority:

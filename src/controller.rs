@@ -25,6 +25,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     crd::{StatusCondition, VaultwardenSecret, VaultwardenSecretSpec, VaultwardenSecretStatus},
+    duration::parse_duration,
     vault::{SecretRequest, VaultClient, VaultError},
 };
 
@@ -287,7 +288,7 @@ async fn patch_status(
     status: VaultwardenSecretStatus,
 ) -> Result<(), ReconcileError> {
     let api: Api<VaultwardenSecret> = Api::namespaced(ctx.client.clone(), ns);
-    let patch = json!({ "status": status });
+    let patch = status_patch(&status);
     api.patch_status(
         name,
         &PatchParams::apply("vaultwarden-operator"),
@@ -295,6 +296,22 @@ async fn patch_status(
     )
     .await?;
     Ok(())
+}
+
+/// Build the JSON merge patch body for a status update.
+///
+/// `#[serde(skip_serializing_if = "String::is_empty")]` on `lastSyncError` means a
+/// cleared error is simply absent from the serialized status — but a JSON merge patch
+/// treats an absent key as "leave the existing value alone", not "clear it". So a
+/// stale `lastSyncError` from an earlier failure would otherwise stick forever, even
+/// once syncs start succeeding again. Explicitly emitting `null` tells the merge patch
+/// to delete the key.
+fn status_patch(status: &VaultwardenSecretStatus) -> serde_json::Value {
+    let mut patch = json!({ "status": status });
+    if status.last_sync_error.is_empty() {
+        patch["status"]["lastSyncError"] = serde_json::Value::Null;
+    }
+    patch
 }
 
 /// Insert or replace a condition in the list (keyed by `type_`).
@@ -359,74 +376,11 @@ fn parse_sync_interval(s: &str) -> Result<Duration, String> {
     if s.is_empty() {
         return Ok(DEFAULT_SYNC_INTERVAL);
     }
-    // Use a simple Go-compatible duration parser: support s, m, h units.
-    let d = humantime_parse(s).map_err(|e| e.to_string())?;
+    let d = parse_duration(s)?;
     if d.is_zero() {
         return Err("syncInterval must be positive".to_string());
     }
     Ok(d)
-}
-
-/// Minimal duration parser supporting Go's common units (s, m, h).
-fn humantime_parse(s: &str) -> Result<Duration, String> {
-    // Try humantime first (handles "5m", "1h30m0s", etc.)
-    // We use a hand-rolled parser to avoid an extra crate dependency.
-    let s = s.trim();
-    let mut total_secs: u64 = 0;
-    let mut remaining = s;
-
-    while !remaining.is_empty() {
-        // Read number.
-        let num_end = remaining
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(remaining.len());
-        if num_end == 0 {
-            return Err(format!("unexpected char in duration {s:?}"));
-        }
-        let num: u64 = remaining[..num_end]
-            .parse()
-            .map_err(|_| format!("invalid number in duration {s:?}"))?;
-        remaining = &remaining[num_end..];
-
-        // Read unit.
-        if remaining.is_empty() {
-            return Err(format!("missing unit in duration {s:?}"));
-        }
-        let (unit, rest) = if let Some(r) = remaining.strip_prefix("ns") {
-            ("ns", r)
-        } else if let Some(r) = remaining.strip_prefix("µs") {
-            ("us", r)
-        } else if let Some(r) = remaining.strip_prefix("us") {
-            ("us", r)
-        } else if let Some(r) = remaining.strip_prefix("ms") {
-            ("ms", r)
-        } else if let Some(r) = remaining.strip_prefix('s') {
-            ("s", r)
-        } else if let Some(r) = remaining.strip_prefix('m') {
-            ("m", r)
-        } else if let Some(r) = remaining.strip_prefix('h') {
-            ("h", r)
-        } else {
-            return Err(format!(
-                "unknown unit in duration {s:?}: {:?}",
-                &remaining[..1]
-            ));
-        };
-
-        let secs = match unit {
-            "ns" => 0,
-            "us" => 0,
-            "ms" => 0,
-            "s" => num,
-            "m" => num * 60,
-            "h" => num * 3600,
-            _ => unreachable!(),
-        };
-        total_secs = total_secs.saturating_add(secs);
-        remaining = rest;
-    }
-
-    Ok(Duration::from_secs(total_secs))
 }
 
 #[cfg(test)]
@@ -535,6 +489,32 @@ mod tests {
         );
         let reqs = build_requests(&s).unwrap();
         assert_eq!(reqs[0].vault, None);
+    }
+
+    #[test]
+    fn test_status_patch_clears_error_on_success() {
+        let status = VaultwardenSecretStatus {
+            ready: true,
+            last_sync_time: Some("2026-09-03T22:13:00Z".to_string()),
+            last_sync_error: String::new(),
+            observed_generation: Some(1),
+            conditions: vec![],
+        };
+        let patch = status_patch(&status);
+        assert_eq!(patch["status"]["lastSyncError"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_status_patch_carries_error_on_failure() {
+        let status = VaultwardenSecretStatus {
+            ready: false,
+            last_sync_time: None,
+            last_sync_error: "boom".to_string(),
+            observed_generation: Some(1),
+            conditions: vec![],
+        };
+        let patch = status_patch(&status);
+        assert_eq!(patch["status"]["lastSyncError"], json!("boom"));
     }
 
     #[test]

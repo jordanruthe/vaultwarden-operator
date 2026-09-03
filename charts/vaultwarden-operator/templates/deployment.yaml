@@ -51,6 +51,14 @@ spec:
                   key: VAULTWARDEN_PASSWORD
             - name: RUST_LOG
               value: {{ .Values.env.RUST_LOG | quote }}
+            {{- with .Values.vault.cacheRefreshInterval }}
+            - name: VAULT_CACHE_REFRESH_INTERVAL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.vault.minRefreshInterval }}
+            - name: VAULT_CACHE_MIN_REFRESH_INTERVAL
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
