@@ -28,8 +28,16 @@ if (!BASE || !EMAIL || !NAME || !PASSWORD) {
   await page.getByRole("button", { name: "Continue" }).click();
   await page.waitForTimeout(1500);
 
-  await page.getByLabel("Master password (required)", { exact: true }).fill(PASSWORD);
-  await page.getByLabel("Confirm master password (required)", { exact: true }).fill(PASSWORD);
+  // Matched by input id rather than accessible label text: the web vault's
+  // label markup has changed shape before (e.g. adding a "*" required marker
+  // inline, which changes the computed accessible name), while these ids
+  // have stayed stable.
+  await page.locator("#input-password-form_new-password").fill(PASSWORD);
+  await page.locator("#input-password-form_new-password-confirm").fill(PASSWORD);
+  // Unchecked because it calls out to the external HIBP API, which this
+  // harness cannot rely on being reachable; leaving it checked can hang the
+  // submit indefinitely instead of failing fast.
+  await page.getByLabel("Check known data breaches for this password").uncheck();
   await page.getByRole("button", { name: /Create account|Submit/i }).click();
 
   // The success toast ("Your new account has been created!") appears before

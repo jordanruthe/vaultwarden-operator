@@ -8,6 +8,7 @@
 //
 // Usage: node create-org.js <httpsBaseUrl> <email> <password> <orgName>
 const { chromium } = require("playwright");
+const { dismissOnboarding } = require("./dismiss-onboarding");
 
 const [, , BASE, EMAIL, PASSWORD, ORG_NAME] = process.argv;
 if (!BASE || !EMAIL || !PASSWORD || !ORG_NAME) {
@@ -26,13 +27,19 @@ if (!BASE || !EMAIL || !PASSWORD || !ORG_NAME) {
   await page.getByRole("button", { name: "Continue" }).click();
   await page.waitForTimeout(1500);
 
-  await page.getByLabel("Master password (required)", { exact: true }).fill(PASSWORD);
-  await page.getByRole("button", { name: "Log in with master password" }).click();
+  // Matched by id / formcontrolname rather than accessible label text: the
+  // web vault's label markup adds a "*" required marker inline, which
+  // changes the computed accessible name (e.g. "Master password (required)"
+  // became "Master password * (required)"), while these attributes have
+  // stayed stable.
+  await page.locator("#masterPassword").fill(PASSWORD);
+  await page.getByRole("button", { name: "Log in" }).click();
   await page.waitForTimeout(2000);
+  await dismissOnboarding(page);
 
   await page.goto(`${BASE}/#/create-organization`, { waitUntil: "networkidle" });
-  await page.getByLabel("Organization name (required)", { exact: true }).fill(ORG_NAME);
-  await page.getByLabel("Email (required)", { exact: true }).fill(EMAIL);
+  await page.locator('input[formcontrolname="name"]').fill(ORG_NAME);
+  await page.locator('input[formcontrolname="billingEmail"]').fill(EMAIL);
   await page.getByRole("button", { name: "Submit" }).click();
 
   // Success lands in the new organization's admin console vault.

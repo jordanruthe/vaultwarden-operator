@@ -11,6 +11,7 @@
 // Usage: node get-api-key.js <httpsBaseUrl> <email> <password>
 // Prints {"clientId":"...","clientSecret":"..."} as JSON to stdout.
 const { chromium } = require("playwright");
+const { dismissOnboarding } = require("./dismiss-onboarding");
 
 const [, , BASE, EMAIL, PASSWORD] = process.argv;
 if (!BASE || !EMAIL || !PASSWORD) {
@@ -29,9 +30,15 @@ if (!BASE || !EMAIL || !PASSWORD) {
   await page.getByRole("button", { name: "Continue" }).click();
   await page.waitForTimeout(1500);
 
-  await page.getByLabel("Master password (required)", { exact: true }).fill(PASSWORD);
-  await page.getByRole("button", { name: "Log in with master password" }).click();
+  // Matched by id rather than accessible label text: the web vault's label
+  // markup adds a "*" required marker inline, which changes the computed
+  // accessible name (e.g. "Master password (required)" became "Master
+  // password * (required)"), while this id has stayed stable across both
+  // the login form and the re-confirmation modal below.
+  await page.locator("#masterPassword").fill(PASSWORD);
+  await page.getByRole("button", { name: "Log in" }).click();
   await page.waitForTimeout(2000);
+  await dismissOnboarding(page);
 
   await page.goto(`${BASE}/#/settings/security/security-keys`, { waitUntil: "networkidle" });
   await page.waitForTimeout(1000);
@@ -39,7 +46,7 @@ if (!BASE || !EMAIL || !PASSWORD) {
   await page.getByRole("button", { name: "View API key" }).click();
   await page.waitForTimeout(500);
   // Re-confirms identity with the master password before revealing the key.
-  await page.getByLabel("Master password (required)", { exact: true }).fill(PASSWORD);
+  await page.locator("#masterPassword").fill(PASSWORD);
   await page.getByRole("button", { name: "View API key" }).click();
   await page.waitForTimeout(1000);
 

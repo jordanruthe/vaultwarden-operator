@@ -49,8 +49,18 @@ TEST_EMAIL="test@example.com"
 TEST_NAME="Test User"
 TEST_PASSWORD="CorrectHorseBatteryStaple1!"
 ORG_NAME="Kubernetes Secrets"
-VW_HTTP_PORT=8380
-TLS_PROXY_PORT=8443
+
+# Dynamically allocated (not hardcoded) so this doesn't collide with an
+# unrelated service already bound to a fixed port on a shared dev machine --
+# a fixed 8443 once silently lost a bind race to an unrelated kind cluster's
+# published port, and the readiness check below happily "passed"
+# against that other service instead of ours, producing baffling connection
+# errors much later in the browser-driven registration step.
+free_port() {
+  python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
+}
+VW_HTTP_PORT="$(free_port)"
+TLS_PROXY_PORT="$(free_port)"
 
 KEEP=false
 SKIP_CARGO=false
@@ -198,10 +208,15 @@ EOF
   log "Port-forwarding Vaultwarden locally"
   kubectl -n vw port-forward svc/vaultwarden "${VW_HTTP_PORT}:80" >"$WORKDIR/port-forward.log" 2>&1 &
   PORT_FORWARD_PID=$!
-  for _ in $(seq 1 20); do
-    curl -sf "http://127.0.0.1:${VW_HTTP_PORT}/" >/dev/null 2>&1 && break
+  local vw_ready=false
+  for _ in $(seq 1 45); do
+    curl -sf "http://127.0.0.1:${VW_HTTP_PORT}/" >/dev/null 2>&1 && { vw_ready=true; break; }
+    kill -0 "$PORT_FORWARD_PID" 2>/dev/null || die "port-forward to vaultwarden died; log:
+$(cat "$WORKDIR/port-forward.log")"
     sleep 1
   done
+  [ "$vw_ready" = true ] || die "vaultwarden not reachable via port-forward after 45s; log:
+$(cat "$WORKDIR/port-forward.log")"
 
   # The web vault signup flow refuses plain HTTP even on loopback, so front
   # the throwaway instance with a self-signed TLS proxy purely to satisfy it.
@@ -211,10 +226,15 @@ EOF
   node "$E2E_DIR/tlsproxy.js" "$WORKDIR/cert.pem" "$WORKDIR/key.pem" "$TLS_PROXY_PORT" \
     "http://127.0.0.1:${VW_HTTP_PORT}" >"$WORKDIR/tlsproxy.log" 2>&1 &
   TLS_PROXY_PID=$!
-  for _ in $(seq 1 20); do
-    curl -sfk "https://127.0.0.1:${TLS_PROXY_PORT}/" >/dev/null 2>&1 && break
+  local tls_ready=false
+  for _ in $(seq 1 45); do
+    curl -sfk "https://127.0.0.1:${TLS_PROXY_PORT}/" >/dev/null 2>&1 && { tls_ready=true; break; }
+    kill -0 "$TLS_PROXY_PID" 2>/dev/null || die "TLS proxy died; log:
+$(cat "$WORKDIR/tlsproxy.log")"
     sleep 1
   done
+  [ "$tls_ready" = true ] || die "TLS proxy not reachable after 45s; log:
+$(cat "$WORKDIR/tlsproxy.log")"
 
   log "Registering throwaway test account"
   node "$E2E_DIR/register.js" "https://127.0.0.1:${TLS_PROXY_PORT}" "$TEST_EMAIL" "$TEST_NAME" "$TEST_PASSWORD"
