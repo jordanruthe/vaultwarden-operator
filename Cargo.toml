@@ -1,6 +1,6 @@
 [package]
 name = "vaultwarden-operator"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Kubernetes operator that syncs Vaultwarden secrets into native Kubernetes Secrets"
 license = "MIT"
