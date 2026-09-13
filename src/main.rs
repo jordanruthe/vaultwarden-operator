@@ -119,6 +119,22 @@ async fn main() -> anyhow::Result<()> {
     let vault_password = required_env("VAULTWARDEN_PASSWORD");
     let client_id = optional_env("VAULTWARDEN_CLIENT_ID");
     let client_secret = optional_env("VAULTWARDEN_CLIENT_SECRET");
+    match (client_id.is_some(), client_secret.is_some()) {
+        (true, true) => info!("auth mode: API key (client_credentials grant)"),
+        (false, false) => info!(
+            "auth mode: password grant (set VAULTWARDEN_CLIENT_ID and \
+             VAULTWARDEN_CLIENT_SECRET to use the API key and bypass 2FA)"
+        ),
+        (id, _) => warn!(
+            "only {} is set; both VAULTWARDEN_CLIENT_ID and VAULTWARDEN_CLIENT_SECRET \
+             are required for API-key auth, falling back to password grant",
+            if id {
+                "VAULTWARDEN_CLIENT_ID"
+            } else {
+                "VAULTWARDEN_CLIENT_SECRET"
+            }
+        ),
+    }
 
     let cache_refresh_interval = env_duration(
         "VAULT_CACHE_REFRESH_INTERVAL",

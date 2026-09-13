@@ -51,17 +51,20 @@ spec:
                 secretKeyRef:
                   name: vaultwarden-operator-credentials
                   key: VAULTWARDEN_PASSWORD
-            # Optional: API key auth (bypasses 2FA)
-            # - name: VAULTWARDEN_CLIENT_ID
-            #   valueFrom:
-            #     secretKeyRef:
-            #       name: vaultwarden-operator-credentials
-            #       key: VAULTWARDEN_CLIENT_ID
-            # - name: VAULTWARDEN_CLIENT_SECRET
-            #   valueFrom:
-            #     secretKeyRef:
-            #       name: vaultwarden-operator-credentials
-            #       key: VAULTWARDEN_CLIENT_SECRET
+            # Optional: API key auth (bypasses 2FA). Used automatically when
+            # both keys exist in the credentials Secret.
+            - name: VAULTWARDEN_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: vaultwarden-operator-credentials
+                  key: VAULTWARDEN_CLIENT_ID
+                  optional: true
+            - name: VAULTWARDEN_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: vaultwarden-operator-credentials
+                  key: VAULTWARDEN_CLIENT_SECRET
+                  optional: true
             - name: RUST_LOG
               value: "info"
             # Optional: override the vault cache refresh intervals (defaults: 5m / 30s)

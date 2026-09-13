@@ -118,6 +118,7 @@ pub async fn authenticate(
         info!("using API-key (client_credentials) grant");
         login_with_api_key(http, base_url, id, secret, device_id).await?
     } else {
+        info!("using password grant");
         let hashed = hash_password(password, &master_key);
         login_with_password(http, base_url, email, &hashed, device_id).await?
     };

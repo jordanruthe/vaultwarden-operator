@@ -35,7 +35,9 @@ rbac:
 
 # -- Reference to the pre-existing Secret that holds Vaultwarden credentials.
 # The Secret must contain VAULTWARDEN_URL, VAULTWARDEN_EMAIL, and VAULTWARDEN_PASSWORD.
-# See README for creation instructions.
+# If it also contains VAULTWARDEN_CLIENT_ID and VAULTWARDEN_CLIENT_SECRET, the
+# operator authenticates with the API key (client_credentials grant), which
+# bypasses 2FA. See README for creation instructions.
 credentials:
   existingSecret: "vaultwarden-operator-credentials"
 
@@ -58,20 +60,6 @@ env:
   RUST_LOG: "info"
 
 # -- Additional environment variables to append (raw envVar objects).
-# Use this to inject optional VAULTWARDEN_CLIENT_ID / VAULTWARDEN_CLIENT_SECRET
-# from the credentials Secret:
-#
-# extraEnv:
-#   - name: VAULTWARDEN_CLIENT_ID
-#     valueFrom:
-#       secretKeyRef:
-#         name: vaultwarden-operator-credentials
-#         key: VAULTWARDEN_CLIENT_ID
-#   - name: VAULTWARDEN_CLIENT_SECRET
-#     valueFrom:
-#       secretKeyRef:
-#         name: vaultwarden-operator-credentials
-#         key: VAULTWARDEN_CLIENT_SECRET
 extraEnv: []
 
 # -- Pod-level security context.

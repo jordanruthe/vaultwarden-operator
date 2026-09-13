@@ -27,7 +27,9 @@ kubectl create secret generic vaultwarden-operator-credentials \
 ```
 
 For API-key auth (bypasses 2FA), also add `VAULTWARDEN_CLIENT_ID` and
-`VAULTWARDEN_CLIENT_SECRET` to the Secret and wire them up via `extraEnv` in your values.
+`VAULTWARDEN_CLIENT_SECRET` to the same Secret. The chart wires them in
+automatically (as optional keys), and the operator logs
+`using API-key (client_credentials) grant` at startup when they are present.
 
 ### 2. Install the chart
 

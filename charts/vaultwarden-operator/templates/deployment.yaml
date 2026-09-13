@@ -49,6 +49,21 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.credentials.existingSecret }}
                   key: VAULTWARDEN_PASSWORD
+            # Optional API-key credentials. Picked up automatically when present
+            # in the credentials Secret; the operator then uses the
+            # client_credentials grant, which bypasses 2FA.
+            - name: VAULTWARDEN_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.credentials.existingSecret }}
+                  key: VAULTWARDEN_CLIENT_ID
+                  optional: true
+            - name: VAULTWARDEN_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.credentials.existingSecret }}
+                  key: VAULTWARDEN_CLIENT_SECRET
+                  optional: true
             - name: RUST_LOG
               value: {{ .Values.env.RUST_LOG | quote }}
             {{- with .Values.vault.cacheRefreshInterval }}

@@ -18,19 +18,8 @@ Before the operator can start, a credentials Secret must exist:
     --from-literal=VAULTWARDEN_PASSWORD=supersecret
 
 For API-key auth (bypasses 2FA), also add VAULTWARDEN_CLIENT_ID and
-VAULTWARDEN_CLIENT_SECRET to the Secret and include them via extraEnv:
-
-  extraEnv:
-    - name: VAULTWARDEN_CLIENT_ID
-      valueFrom:
-        secretKeyRef:
-          name: {{ .Values.credentials.existingSecret }}
-          key: VAULTWARDEN_CLIENT_ID
-    - name: VAULTWARDEN_CLIENT_SECRET
-      valueFrom:
-        secretKeyRef:
-          name: {{ .Values.credentials.existingSecret }}
-          key: VAULTWARDEN_CLIENT_SECRET
+VAULTWARDEN_CLIENT_SECRET to the same Secret. They are picked up automatically;
+the operator logs "using API-key (client_credentials) grant" at startup.
 
 ==> Creating a VaultwardenSecret
 

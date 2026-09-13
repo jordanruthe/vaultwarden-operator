@@ -112,7 +112,7 @@ kubectl create secret generic vaultwarden-operator-credentials \
   --from-literal=VAULTWARDEN_PASSWORD=supersecret
 ```
 
-For API-key auth (bypasses 2FA), also add `VAULTWARDEN_CLIENT_ID` and `VAULTWARDEN_CLIENT_SECRET` to the above Secret and uncomment the corresponding env vars in `config/manager/deployment.yaml`.
+For API-key auth (bypasses 2FA), also add `VAULTWARDEN_CLIENT_ID` and `VAULTWARDEN_CLIENT_SECRET` to the above Secret. The manifest references them as optional keys, so they are used automatically when present; the operator logs `using API-key (client_credentials) grant` at startup.
 
 ### 3. Apply RBAC and Deployment
 
