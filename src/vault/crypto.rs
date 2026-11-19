@@ -384,6 +384,25 @@ pub fn decrypt_org_key(
     })
 }
 
+/// Decrypt a per-item cipher key (`cipher.key`) with the user or organization key.
+/// The plaintext is a 64-byte symmetric key: `enc_key[0..32]` + `mac_key[32..64]`.
+pub fn decrypt_cipher_key(
+    encrypted_key: &str,
+    key: &SymmetricKey,
+) -> Result<SymmetricKey, CryptoError> {
+    if encrypted_key.is_empty() {
+        return Err(CryptoError::EmptyKey);
+    }
+    let decrypted = CipherString::parse(encrypted_key)?.decrypt(key)?;
+    if decrypted.len() != 64 {
+        return Err(CryptoError::SymKeyLength(decrypted.len()));
+    }
+    Ok(SymmetricKey {
+        enc_key: decrypted[..32].to_vec(),
+        mac_key: decrypted[32..].to_vec(),
+    })
+}
+
 /// Remove PKCS#7 padding from a block-aligned buffer.
 fn pkcs7_unpad(data: &[u8], block_size: usize) -> Result<Vec<u8>, CryptoError> {
     if data.is_empty() {

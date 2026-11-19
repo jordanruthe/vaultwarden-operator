@@ -13,7 +13,10 @@ use serde::Deserialize;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use super::crypto::{decrypt_org_key, decrypt_private_key, decrypt_str, CryptoError, SymmetricKey};
+use super::crypto::{
+    decrypt_cipher_key, decrypt_org_key, decrypt_private_key, decrypt_str, CryptoError,
+    SymmetricKey,
+};
 
 #[derive(Debug, Error)]
 pub enum SyncError {
@@ -72,6 +75,11 @@ pub struct SyncCipher {
     #[serde(rename = "organizationId")]
     pub organization_id: Option<String>,
     pub name: String,
+    /// Per-item cipher key (Bitwarden clients >= 2024.2). When present, the item's
+    /// fields are encrypted with this key, which is itself encrypted with the
+    /// user or organization key.
+    #[serde(default)]
+    pub key: Option<String>,
     pub notes: Option<String>,
     pub login: Option<SyncLogin>,
     pub card: Option<SyncCard>,
@@ -279,7 +287,7 @@ pub fn decrypt_vault(sync: &SyncResponse, sym_key: &SymmetricKey) -> (VaultCache
         match decrypt_cipher(cipher, key) {
             Ok(item) => items.push(item),
             Err(e) => {
-                debug!(cipher_id = %cipher.id, err = %e, "failed to decrypt cipher; skipping");
+                warn!(cipher_id = %cipher.id, err = %e, "failed to decrypt cipher; skipping");
                 skips.decrypt_failed += 1;
             }
         }
@@ -309,6 +317,17 @@ pub fn decrypt_cipher(
     cipher: &SyncCipher,
     key: &SymmetricKey,
 ) -> Result<DecryptedItem, CryptoError> {
+    // Items with a per-item key: unwrap it with the user/org key, then use it for
+    // every field of this cipher.
+    let item_key;
+    let key = match cipher.key.as_deref().filter(|k| !k.is_empty()) {
+        Some(wrapped) => {
+            item_key = decrypt_cipher_key(wrapped, key)?;
+            &item_key
+        }
+        None => key,
+    };
+
     let name = decrypt_str(&cipher.name, key)?;
     let notes = match &cipher.notes {
         Some(n) => decrypt_str(n, key).unwrap_or_default(),
@@ -552,6 +571,7 @@ mod tests {
             cipher_type: CIPHER_TYPE_LOGIN,
             organization_id: Some(org_id),
             name: enc_name,
+            key: None,
             notes: None,
             login: None,
             card: None,
@@ -568,6 +588,43 @@ mod tests {
     }
 
     #[test]
+    fn test_decrypt_cipher_with_per_item_key() {
+        let (user_key, user_enc, user_mac) = make_key();
+        let item_enc: [u8; 32] = std::array::from_fn(|i| (i + 200) as u8);
+        let item_mac: [u8; 32] = std::array::from_fn(|i| (i + 7) as u8);
+        let mut raw_item_key = item_enc.to_vec();
+        raw_item_key.extend_from_slice(&item_mac);
+
+        let cipher = SyncCipher {
+            id: "cipher-itemkey".to_string(),
+            cipher_type: CIPHER_TYPE_LOGIN,
+            organization_id: None,
+            name: encrypt_type2(&item_enc, &item_mac, &[3u8; 16], b"ITEM_KEYED"),
+            key: Some(encrypt_type2(
+                &user_enc,
+                &user_mac,
+                &[4u8; 16],
+                &raw_item_key,
+            )),
+            notes: Some(encrypt_type2(&item_enc, &item_mac, &[5u8; 16], b"note")),
+            login: None,
+            card: None,
+            fields: vec![],
+        };
+
+        let item = decrypt_cipher(&cipher, &user_key).unwrap();
+        assert_eq!(item.name, "ITEM_KEYED");
+        assert_eq!(item.notes, "note");
+
+        // Without honoring the item key, the name fails MAC verification.
+        let no_key = SyncCipher {
+            key: None,
+            ..cipher
+        };
+        assert!(decrypt_cipher(&no_key, &user_key).is_err());
+    }
+
+    #[test]
     fn test_decrypt_cipher_empty_org_id_normalized() {
         let (key, enc_key, mac_key) = make_key();
         let iv = [0u8; 16];
@@ -577,6 +634,7 @@ mod tests {
             cipher_type: CIPHER_TYPE_SECURE_NOTE,
             organization_id: Some(String::new()),
             name: encrypt_type2(&enc_key, &mac_key, &iv, b"X"),
+            key: None,
             notes: None,
             login: None,
             card: None,
@@ -599,6 +657,7 @@ mod tests {
             cipher_type: CIPHER_TYPE_SECURE_NOTE,
             organization_id: None,
             name: enc_name,
+            key: None,
             notes: None,
             login: None,
             card: None,
@@ -792,6 +851,7 @@ mod tests {
             cipher_type: CIPHER_TYPE_LOGIN,
             organization_id: Some(org_id.clone()),
             name: enc_name,
+            key: None,
             notes: None,
             login: None,
             card: None,
