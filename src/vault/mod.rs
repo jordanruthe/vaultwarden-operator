@@ -206,6 +206,24 @@ impl VaultClient {
         }
     }
 
+    /// Force a vault re-sync for an explicit user request (the force-sync annotation),
+    /// bypassing the `min_refresh_interval` cooldown.
+    ///
+    /// `requested_at` is when the caller's request began. If another refresh already
+    /// completed after that point (e.g. `kubectl annotate --all` fanning out across many
+    /// CRs), the cache is already fresh enough and this is a no-op — so a batch collapses
+    /// into a single `/api/sync` call.
+    pub async fn force_refresh(&self, requested_at: Instant) -> Result<(), VaultError> {
+        let _guard = self.refresh_lock.lock().await;
+
+        if self.inner.read().await.last_refresh_at >= requested_at {
+            debug!("forced refresh skipped; cache already refreshed since the request");
+            return Ok(());
+        }
+
+        self.refresh_vault_cache().await
+    }
+
     /// Re-sync the entire vault and update the decrypted item cache.
     pub async fn refresh_vault_cache(&self) -> Result<(), VaultError> {
         self.ensure_valid_token().await?;

@@ -16,13 +16,16 @@
 #   4. refresh-on-miss: a CR referencing a not-yet-existing vault item fails,
 #      then becomes ready shortly after the item is created -- without
 #      waiting for the ~5min background cache refresh
-#   5. leader failover (killing the leader hands off within the lease TTL and
+#   5. force-sync: annotating a CR with secrets.vaultwarden.io/force-sync makes
+#      a rotated vault value land in seconds (bypassing the vault cache), and
+#      the operator removes the annotation so the same command is repeatable
+#   6. leader failover (killing the leader hands off within the lease TTL and
 #      reconciliation resumes under the new leader)
-#   6. API-key auth: fetches a personal API key for the test account and
+#   7. API-key auth: fetches a personal API key for the test account and
 #      restarts the operator with VAULTWARDEN_CLIENT_ID/CLIENT_SECRET wired
 #      in (the chart's `extraEnv` mechanism), confirming it still
 #      authenticates and reconciles
-#   7. the RBAC-gap failure mode: if the `leases` ClusterRole rule is missing,
+#   8. the RBAC-gap failure mode: if the `leases` ClusterRole rule is missing,
 #      every pod passes health probes but never reconciles (silent stall) --
 #      this documents the symptom to watch for if RBAC lags the image during
 #      a real rollout.
@@ -526,6 +529,94 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Step: force-sync annotation
+#
+# `kubectl annotate vws <name> secrets.vaultwarden.io/force-sync=1` must bypass
+# both the CR's syncInterval and the vault cache: a rotated vault value has to
+# land in seconds, not after the ~5min background refresh. The operator removes
+# the annotation once handled, so the identical command must work twice in a
+# row without --overwrite.
+# ---------------------------------------------------------------------------
+wait_force_sync_annotation_cleared() {
+  local ann="x"
+  for _ in $(seq 1 30); do
+    ann="$(kubectl -n app-test get vaultwardensecret test-secret-force-sync -o jsonpath='{.metadata.annotations.secrets\.vaultwarden\.io/force-sync}')"
+    [ -z "$ann" ] && return 0
+    sleep 1
+  done
+  die "force-sync annotation was not removed by the operator ($1)"
+}
+
+step_verify_force_sync() {
+  log "Verifying the force-sync annotation bypasses the vault cache"
+
+  local item_json="$WORKDIR/force-sync-item.json"
+  cat >"$item_json" <<EOF
+{"organizationId":null,"folderId":null,"type":1,"name":"force-sync-secret","notes":null,"favorite":false,"reprompt":0,"login":{"username":"forceuser","password":"force-value-1","totp":null,"uris":[]},"fields":[],"passwordHistory":[]}
+EOF
+  local encoded
+  encoded="$(NODE_TLS_REJECT_UNAUTHORIZED=0 bw encode <"$item_json")"
+  NODE_TLS_REJECT_UNAUTHORIZED=0 bw create item "$encoded" >/dev/null
+  local item_id
+  item_id="$(NODE_TLS_REJECT_UNAUTHORIZED=0 bw list items --search force-sync-secret | python3 -c 'import json,sys;print(json.load(sys.stdin)[0]["id"])')"
+
+  # Default (5m) syncInterval on purpose: nothing but the annotation should be
+  # able to refresh this Secret within the windows asserted below.
+  kubectl apply -n app-test -f - >/dev/null <<'EOF'
+apiVersion: secrets.vaultwarden.io/v1alpha1
+kind: VaultwardenSecret
+metadata:
+  name: test-secret-force-sync
+  namespace: app-test
+spec:
+  data:
+    - key: password
+      secretName: force-sync-secret
+EOF
+
+  # The item was created moments ago, so the first reconcile may miss inside the
+  # ~30s refresh-on-miss cooldown and then not retry for 5m. Nudge with the
+  # annotation itself (a no-op error while one is still pending).
+  local value=""
+  for _ in $(seq 1 60); do
+    value="$(kubectl -n app-test get secret test-secret-force-sync -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+    [ "$value" = "force-value-1" ] && break
+    kubectl -n app-test annotate vaultwardensecret test-secret-force-sync \
+      secrets.vaultwarden.io/force-sync=1 >/dev/null 2>&1 || true
+    sleep 2
+  done
+  [ "$value" = "force-value-1" ] || die "initial sync of test-secret-force-sync failed (got: $value)"
+
+  local round new_value updated
+  for round in 2 3; do
+    new_value="force-value-${round}"
+    log "Rotating vault item to ${new_value} and force-syncing"
+    updated="$(NODE_TLS_REJECT_UNAUTHORIZED=0 bw get item "$item_id" | NEW_VALUE="$new_value" python3 -c 'import json,os,sys; d=json.load(sys.stdin); d["login"]["password"]=os.environ["NEW_VALUE"]; print(json.dumps(d))')"
+    encoded="$(echo "$updated" | NODE_TLS_REJECT_UNAUTHORIZED=0 bw encode)"
+    NODE_TLS_REJECT_UNAUTHORIZED=0 bw edit item "$item_id" "$encoded" >/dev/null
+
+    # The exact same command each round (no --overwrite) proves repeatability;
+    # it only succeeds if the operator removed the previous annotation.
+    wait_force_sync_annotation_cleared "before rotating to ${new_value}"
+    kubectl -n app-test annotate vaultwardensecret test-secret-force-sync \
+      secrets.vaultwarden.io/force-sync=1 >/dev/null
+
+    value=""
+    for _ in $(seq 1 30); do
+      value="$(kubectl -n app-test get secret test-secret-force-sync -o jsonpath='{.data.password}' | base64 -d)"
+      [ "$value" = "$new_value" ] && break
+      sleep 1
+    done
+    [ "$value" = "$new_value" ] || die "force-sync did not pick up the rotated value within 30s (got: $value)"
+  done
+
+  wait_force_sync_annotation_cleared "after the final sync"
+
+  kubectl -n app-test delete vaultwardensecret test-secret-force-sync --wait=false >/dev/null
+  log "force-sync OK (rotated values landed in seconds, twice, and the annotation was removed each time)"
+}
+
+# ---------------------------------------------------------------------------
 # Step: failover
 # ---------------------------------------------------------------------------
 step_verify_failover() {
@@ -698,6 +789,7 @@ main() {
   step_verify_vault_scoping_negative
   step_verify_status_error_clears
   step_verify_refresh_on_miss
+  step_verify_force_sync
   step_verify_failover
   step_verify_api_key_auth
   step_verify_rbac_gap

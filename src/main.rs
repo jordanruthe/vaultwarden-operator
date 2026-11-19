@@ -28,7 +28,7 @@ use kube::{
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use controller::{error_policy, reconcile, Context};
+use controller::{error_policy, force_sync_predicate, reconcile, Context};
 use crd::VaultwardenSecret;
 use vault::initialize_vault_client;
 
@@ -245,12 +245,20 @@ async fn main() -> anyhow::Result<()> {
     // a Secret or status until the operator restarts. Combining with finalizers lets
     // the finalizer-add event through while still filtering status-only writes (which
     // change neither generation nor finalizers).
+    //
+    // force_sync_predicate additionally lets the force-sync annotation through (and only
+    // that annotation), so `kubectl annotate vws <name> secrets.vaultwarden.io/force-sync=1`
+    // triggers an immediate reconcile. Status writes don't touch it either.
     let (reader, writer) = reflector::store();
     let vws_stream = watcher(vws_api, watcher::Config::default())
         .default_backoff()
         .reflect(writer)
         .applied_objects()
-        .predicate_filter(predicates::generation.combine(predicates::finalizers));
+        .predicate_filter(
+            predicates::generation
+                .combine(predicates::finalizers)
+                .combine(force_sync_predicate),
+        );
 
     Controller::for_stream(vws_stream, reader)
         .owns(secrets_api, watcher::Config::default())

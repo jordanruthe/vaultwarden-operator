@@ -68,6 +68,25 @@ in the Helm chart's `values.yaml`):
 A vault name matching multiple organizations (`VaultAmbiguous`) is a naming conflict,
 not staleness, so it fails immediately without triggering a refresh.
 
+### Force refresh
+
+To re-sync a secret right now — e.g. just after rotating a value in Vaultwarden — annotate
+its `VaultwardenSecret`:
+
+```sh
+kubectl annotate vws my-secret secrets.vaultwarden.io/force-sync=1
+
+# or everything in a namespace
+kubectl annotate vws -n my-namespace --all secrets.vaultwarden.io/force-sync=1
+```
+
+The operator re-fetches the vault from Vaultwarden (bypassing both the cache and the
+`VAULT_CACHE_MIN_REFRESH_INTERVAL` cooldown), rewrites the managed `Secret`, updates
+`status`, and then **removes the annotation** — so the exact same command works again next
+time, with no `--overwrite` and no unique value needed (the value is ignored). Annotating
+many CRs at once collapses into a single `/api/sync` call. If the forced refresh fails, the
+CR goes `Ready=false` with the reason in `status.lastSyncError`.
+
 ### Secret value extraction priority
 
 For each vault item, the operator extracts the value using this priority:

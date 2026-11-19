@@ -7,7 +7,12 @@
 //! - `Ready` / `SyncFailed` status conditions
 //! - Per-CR `spec.syncInterval` requeue
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    hash::{DefaultHasher, Hash, Hasher},
+    sync::Arc,
+    time::Duration,
+};
 
 use chrono::Utc;
 use k8s_openapi::api::core::v1::Secret;
@@ -21,6 +26,7 @@ use kube::{
 };
 use serde_json::json;
 use thiserror::Error;
+use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -32,6 +38,11 @@ use crate::{
 const FINALIZER_NAME: &str = "secrets.vaultwarden.io/finalizer";
 const MANAGED_BY_LABEL: &str = "vaultwarden-operator";
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Annotation that requests an immediate, cache-bypassing sync of one CR:
+/// `kubectl annotate vws <name> secrets.vaultwarden.io/force-sync=1`.
+/// The value is ignored; the operator removes the annotation once handled.
+pub const FORCE_SYNC_ANNOTATION: &str = "secrets.vaultwarden.io/force-sync";
 
 const CONDITION_READY: &str = "Ready";
 const CONDITION_SYNC_FAILED: &str = "SyncFailed";
@@ -75,9 +86,57 @@ pub async fn reconcile(
 }
 
 /// Called when the CR exists and is not being deleted.
+///
+/// Handles the force-sync annotation around the regular sync: a forced vault re-sync
+/// first, then the annotation is removed once the request has been handled so the same
+/// `kubectl annotate` command works again next time.
 async fn reconcile_apply(
     vws: Arc<VaultwardenSecret>,
     ctx: Arc<Context>,
+) -> Result<Action, ReconcileError> {
+    let requested_at = Instant::now();
+
+    if !vws.annotations().contains_key(FORCE_SYNC_ANNOTATION) {
+        return sync_once(&vws, &ctx).await;
+    }
+
+    let ns = vws.namespace().unwrap_or_else(|| "default".to_string());
+    let name = vws.name_any();
+    info!(vws = %name, ns = %ns, "force-sync requested via annotation");
+
+    // A kube API error (`?`) leaves the annotation in place, so the error_policy
+    // retry still forces. Handled failures are reported via status instead; leaving
+    // the annotation there would re-force a vault sync on every requeue.
+    let action = match ctx.vault.force_refresh(requested_at).await {
+        Ok(()) => sync_once(&vws, &ctx).await?,
+        Err(e) => {
+            // Don't report Ready from a cache the user explicitly asked to bypass.
+            let msg = format!("forced vault refresh failed: {e}");
+            warn!(vws = %name, "{msg}");
+            set_failed_status(&vws, &ctx, &msg).await?;
+            Action::requeue(
+                parse_sync_interval(&vws.spec.sync_interval).unwrap_or(DEFAULT_SYNC_INTERVAL),
+            )
+        }
+    };
+
+    // Removing the annotation changes `force_sync_predicate`'s hash, so it triggers one
+    // extra reconcile. That one takes the cheap cache-backed path above — harmless.
+    let api: Api<VaultwardenSecret> = Api::namespaced(ctx.client.clone(), &ns);
+    api.patch(
+        &name,
+        &PatchParams::default(),
+        &Patch::Merge(clear_force_sync_patch()),
+    )
+    .await?;
+
+    Ok(action)
+}
+
+/// One regular sync: vault cache → managed Secret → status.
+async fn sync_once(
+    vws: &Arc<VaultwardenSecret>,
+    ctx: &Arc<Context>,
 ) -> Result<Action, ReconcileError> {
     let ns = vws.namespace().unwrap_or_else(|| "default".to_string());
     let name = vws.name_any();
@@ -87,7 +146,7 @@ async fn reconcile_apply(
         Ok(d) => d,
         Err(msg) => {
             warn!(vws = %name, "invalid syncInterval: {msg}");
-            set_failed_status(&vws, &ctx, &msg).await?;
+            set_failed_status(vws, ctx, &msg).await?;
             return Ok(Action::requeue(DEFAULT_SYNC_INTERVAL));
         }
     };
@@ -97,7 +156,7 @@ async fn reconcile_apply(
         Ok(r) => r,
         Err(msg) => {
             warn!(vws = %name, "invalid spec: {msg}");
-            set_failed_status(&vws, &ctx, &msg).await?;
+            set_failed_status(vws, ctx, &msg).await?;
             return Ok(Action::requeue(interval));
         }
     };
@@ -108,7 +167,7 @@ async fn reconcile_apply(
         Err(e) => {
             let msg = format!("failed to fetch Vaultwarden secrets: {e}");
             warn!(vws = %name, "{msg}");
-            set_failed_status(&vws, &ctx, &msg).await?;
+            set_failed_status(vws, ctx, &msg).await?;
             return Ok(Action::requeue(interval));
         }
     };
@@ -169,10 +228,27 @@ async fn reconcile_apply(
     }
 
     // Update status: success.
-    set_ready_status(&vws, &ctx).await?;
+    set_ready_status(vws, ctx).await?;
     debug!(vws = %name, ?interval, "reconcile complete; requeuing");
 
     Ok(Action::requeue(interval))
+}
+
+/// Watch-stream predicate: hashes only the force-sync annotation's value, so adding
+/// (or removing) it triggers a reconcile while unrelated annotation churn
+/// (`last-applied-configuration`, GitOps tracking IDs, …) still doesn't.
+pub fn force_sync_predicate(obj: &VaultwardenSecret) -> Option<u64> {
+    let mut hasher = DefaultHasher::new();
+    obj.annotations()
+        .get(FORCE_SYNC_ANNOTATION)
+        .hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// JSON merge patch body that removes the force-sync annotation (explicit `null`
+/// deletes the key; see `status_patch` for the same merge-patch subtlety).
+fn clear_force_sync_patch() -> serde_json::Value {
+    json!({ "metadata": { "annotations": { FORCE_SYNC_ANNOTATION: null } } })
 }
 
 /// Handle controller errors — log and requeue after the default interval.
@@ -422,6 +498,43 @@ mod tests {
     fn test_parse_sync_interval_invalid() {
         assert!(parse_sync_interval("abc").is_err());
         assert!(parse_sync_interval("5x").is_err());
+    }
+
+    fn vws_with_annotations(annotations: &[(&str, &str)]) -> VaultwardenSecret {
+        let mut vws = VaultwardenSecret::new("test", spec("data: []\n"));
+        vws.metadata.annotations = Some(
+            annotations
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        vws
+    }
+
+    #[test]
+    fn test_force_sync_predicate_tracks_only_its_annotation() {
+        let none = force_sync_predicate(&vws_with_annotations(&[]));
+        let set = force_sync_predicate(&vws_with_annotations(&[(FORCE_SYNC_ANNOTATION, "1")]));
+        let set_other_value =
+            force_sync_predicate(&vws_with_annotations(&[(FORCE_SYNC_ANNOTATION, "2")]));
+        let unrelated = force_sync_predicate(&vws_with_annotations(&[("example.com/foo", "bar")]));
+
+        assert_ne!(none, set);
+        assert_ne!(set, set_other_value);
+        assert_eq!(none, unrelated);
+    }
+
+    #[test]
+    fn test_clear_force_sync_patch_emits_explicit_null() {
+        let patch = clear_force_sync_patch();
+        assert_eq!(
+            patch["metadata"]["annotations"][FORCE_SYNC_ANNOTATION],
+            serde_json::Value::Null
+        );
+        assert!(patch["metadata"]["annotations"]
+            .as_object()
+            .unwrap()
+            .contains_key(FORCE_SYNC_ANNOTATION));
     }
 
     fn spec(yaml: &str) -> VaultwardenSecretSpec {
